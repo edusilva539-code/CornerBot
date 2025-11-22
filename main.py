@@ -2,56 +2,107 @@ import asyncio
 import requests
 from telegram import Bot
 
-# ----------------------------
-# CONFIGURAÇÕES DO SEU BOT
-# ----------------------------
-API_KEY = "f500ec36b5mshd40feb8f3fb438ap16eb00jsn71f83269e819"
-HOST = "api-football-v1.p.rapidapi.com"
+# =============================
+# CONFIG
+# =============================
+API_KEY = "74e372055593a55e7cbcc79df1097907"
+BASE_URL = "https://v3.football.api-sports.io"
 
 TELEGRAM_TOKEN = "8239858396:AAEohsJJcgJwaCC4ioG1ZEek4HesI3NhwQ8"
-CHAT_ID = 441778236  # número, não string
+CHAT_ID = 441778236
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
+headers = {
+    "x-apisports-key": API_KEY
+}
 
-# ----------------------------
-# FUNÇÃO: busca jogos ao vivo
-# ----------------------------
-def get_live_matches():
-    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
-    params = {"live": "all"}
-    headers = {
-        "X-RapidAPI-Key": API_KEY,
-        "X-RapidAPI-Host": HOST
-    }
+# ==========================================
+# BUSCA PARTIDAS AO VIVO (API SPORTS DIRETO)
+# ==========================================
+def get_live():
+    url = f"{BASE_URL}/fixtures?live=all"
+    r = requests.get(url, headers=headers)
+    return r.json()
 
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        return response.json()
-    except Exception as e:
-        return {"response": [], "error": str(e)}
+# ===============================
+# REGRAS (A gente vai completar)
+# ===============================
+
+def rule_over_ht_corners(match):
+    stats = match["statistics"]
+    total = stats["corners"]
+    minute = match["fixture"]["status"]["elapsed"]
+
+    return minute >= 20 and total >= 4, f"OVER HT — {total} cantos aos {minute} min"
+
+def rule_over_ft_corners(match):
+    stats = match["statistics"]
+    total = stats["corners"]
+    minute = match["fixture"]["status"]["elapsed"]
+
+    return minute >= 55 and total >= 7, f"OVER FT — {total} cantos aos {minute} min"
+
+def rule_next_corner(match):
+    pressure = match["pressure"]
+    return pressure >= 70, f"PRÓXIMO CANTO — pressão {pressure}%"
+
+def rule_asian_line(match):
+    stats = match["statistics"]
+    diff = abs(stats["home_corners"] - stats["away_corners"])
+    return diff >= 2, "AH +1 Corner (desbalanceio detectado)"
+
+def rule_team_corners(match):
+    stats = match["statistics"]
+    return stats["home_corners"] >= 4, "Cantos time da casa — 4 ou mais"
+
+def rule_both_teams_corners(match):
+    stats = match["statistics"]
+    return stats["home_corners"] >= 2 and stats["away_corners"] >= 2, "Ambos Times Cantos"
+
+def rule_high_pressure(match):
+    pressure = match["pressure"]
+    attacks = match["statistics"]["dangerous_attacks"]
+
+    return pressure >= 60 and attacks >= 20, f"Pressão Alta — {attacks} ataques perigosos"
 
 
-# ----------------------------
-# LOOP PRINCIPAL
-# ----------------------------
-async def bot_loop():
-    await bot.send_message(chat_id=CHAT_ID, text="🔥 CornerBot v20 iniciado com sucesso!")
+ALL_RULES = [
+    rule_over_ht_corners,
+    rule_over_ft_corners,
+    rule_next_corner,
+    rule_asian_line,
+    rule_team_corners,
+    rule_both_teams_corners,
+    rule_high_pressure,
+]
+
+# ===============================
+# LÓGICA PRINCIPAL
+# ===============================
+async def main():
+    await bot.send_message(chat_id=CHAT_ID, text="CornerBot (API-SPORTS) Iniciado!")
 
     while True:
-        data = get_live_matches()
-        qtd = len(data.get("response", []))
+        data = get_live()
+        matches = data.get("response", [])
 
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"📊 Jogos ao vivo detectados: {qtd}"
-        )
+        for match in matches:
+            # MOCK da estrutura (vamos ajustar depois com dados reais)
+            match["statistics"] = {
+                "corners": 6,
+                "home_corners": 3,
+                "away_corners": 3,
+                "dangerous_attacks": 22
+            }
+            match["pressure"] = 75
 
-        await asyncio.sleep(60)  # 1 minuto
+            for rule in ALL_RULES:
+                ok, msg = rule(match)
+                if ok:
+                    await bot.send_message(chat_id=CHAT_ID, text="⚽ " + msg)
 
+        await asyncio.sleep(30)
 
-# ----------------------------
-# INICIALIZAÇÃO
-# ----------------------------
 if __name__ == "__main__":
-    asyncio.run(bot_loop())
+    asyncio.run(main())
