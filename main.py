@@ -2,170 +2,112 @@ import asyncio
 import requests
 from telegram import Bot
 
-# ==========================
-# CONFIGURAÇÕES
-# ==========================
-API_KEY = "74e372055593a55e7cbcc79df1097907"   # SUA KEY NOVA
-BASE_URL = "https://v3.football.api-sports.io"
+API_KEY = "74e372055593a55e7cbcc79df1097907"   # SUA API SPORTS
+BASE = "https://v3.football.api-sports.io"
+
 TELEGRAM_TOKEN = "8239858396:AAEohsJJcgJwaCC4ioG1ZEek4HesI3NhwQ8"
 CHAT_ID = 441778236
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-HEADERS = {
-    "x-apisports-key": API_KEY,
-}
 
-# ==========================
-# FUNÇÃO: PEGAR JOGOS AO VIVO
-# ==========================
-def get_live_matches():
-    url = f"{BASE_URL}/fixtures"
+def get_live():
+    url = f"{BASE}/fixtures"
+    headers = {"x-apisports-key": API_KEY}
     params = {"live": "all"}
-    r = requests.get(url, headers=HEADERS, params=params)
+    r = requests.get(url, headers=headers, params=params)
     return r.json().get("response", [])
 
 
-# ==========================
-# REGRA 1 – Over HT Corners
-# ==========================
-def rule_over_ht(match):
-    stats = match.get("statistics", [])
-    minute = match["fixture"]["status"]["elapsed"]
-    if minute is None or minute > 45:
-        return None
-
-    total = get_corners(match)
-    if total >= 5:
-        return f"🔥 Over HT 4.5 – {total} cantos aos {minute}min"
-    return None
-
-
-# ==========================
-# REGRA 2 – Over FT Corners
-# ==========================
-def rule_over_ft(match):
-    stats = match.get("statistics", [])
-    minute = match["fixture"]["status"]["elapsed"]
-    total = get_corners(match)
-
-    if minute >= 70 and total >= 9:
-        return f"🔥 Over FT 9.5 – {total} cantos aos {minute}min"
-    return None
-
-
-# ==========================
-# REGRA 3 – Próximo Escanteio
-# ==========================
-def rule_next_corner(match):
-    pressure = detect_pressure(match)
-    if pressure >= 70:
-        return f"⚡ Próximo escanteio provável – pressão {pressure}%"
-    return None
-
-
-# ==========================
-# REGRA 4 – Asiático de Escanteios
-# ==========================
-def rule_asian(match):
-    total = get_corners(match)
-    minute = match["fixture"]["status"]["elapsed"]
-
-    if minute >= 60 and total in [7, 8]:
-        return f"📘 AH +1 Corner – total atual {total}"
-    return None
-
-
-# ==========================
-# REGRA 5 – Escanteios por equipe
-# ==========================
-def rule_team_corner(match):
-    hc, ac = get_team_corners(match)
-    minute = match["fixture"]["status"]["elapsed"]
-
-    if minute >= 30 and hc >= 4:
-        return f"🟦 Casa > 4 cantos – {hc} até agora"
-
-    if minute >= 30 and ac >= 4:
-        return f"🟥 Fora > 4 cantos – {ac} até agora"
-
-    return None
-
-
-# ==========================
-# REGRA 6 – Ambos Times Cantos
-# ==========================
-def rule_btts_corners(match):
-    hc, ac = get_team_corners(match)
-    minute = match["fixture"]["status"]["elapsed"]
-
-    if minute >= 35 and hc >= 2 and ac >= 2:
-        return f"🔰 Ambos Teams Cantos OK – {hc}/{ac}"
-    return None
-
-
-# ==========================
-# REGRA 7 – Bot de Pressão Alta
-# ==========================
-def rule_high_pressure(match):
-    pressure = detect_pressure(match)
-    if pressure >= 75:
-        return f"🔥⚡ Pressão MUITO ALTA: {pressure}%"
-    return None
-
-
-# ==========================
-# FUNÇÕES AUXILIARES
-# ==========================
 def get_corners(match):
-    try:
-        return match["statistics"][0]["statistics"][6]["value"] + match["statistics"][1]["statistics"][6]["value"]
-    except:
-        return 0
-
-def get_team_corners(match):
-    try:
-        home = match["statistics"][0]["statistics"][6]["value"]
-        away = match["statistics"][1]["statistics"][6]["value"]
-        return home, away
-    except:
-        return 0, 0
-
-def detect_pressure(match):
-    try:
-        attacks = match["statistics"][0]["statistics"][12]["value"] + match["statistics"][1]["statistics"][12]["value"]
-        dangerous = match["statistics"][0]["statistics"][13]["value"] + match["statistics"][1]["statistics"][13]["value"]
-        total = attacks + dangerous
-        return int((dangerous / total) * 100)
-    except:
-        return 0
+    stats = match.get("statistics", [])
+    total = 0
+    for t in stats:
+        for s in t.get("statistics", []):
+            if s.get("type") == "Corner Kicks":
+                total += s.get("value", 0)
+    return total
 
 
-# ==========================
-# EXECUÇÃO PRINCIPAL
-# ==========================
+def apply_rules(match):
+    minute = match["fixture"]["status"]["elapsed"]
+    corners = get_corners(match)
+
+    checks = []
+
+    if minute >= 20 and corners >= 5:
+        checks.append("1️⃣ Over HT > 4.5")
+
+    if minute >= 60 and corners >= 9:
+        checks.append("2️⃣ Over FT > 9.5")
+
+    if minute >= 10 and corners >= 3:
+        checks.append("3️⃣ Próximo Escanteio")
+
+    if minute >= 30 and corners >= 6:
+        checks.append("4️⃣ AH asiático cantos")
+
+    if minute >= 25 and corners >= 4:
+        checks.append("5️⃣ Cantos por equipe")
+
+    if minute >= 35 and corners >= 7:
+        checks.append("6️⃣ Ambos Times Cantos")
+
+    if minute >= 15 and corners >= 4:
+        checks.append("7️⃣ Pressão para próximo canto")
+
+    return checks
+
+
+async def send(msg):
+    return await bot.send_message(chat_id=CHAT_ID, text=msg)
+
+
+async def edit(mid, text):
+    await bot.edit_message_text(chat_id=CHAT_ID, message_id=mid, text=text)
+
+
 async def main():
-    await bot.send_message(chat_id=CHAT_ID, text="⚽ CornerBot – API SPORTS iniciado!")
+    await send("🔥 *CornerBot INICIADO* – monitorando jogos ao vivo...")
+
+    sent = {}
 
     while True:
-        matches = get_live_matches()
+        matches = get_live()
 
-        for match in matches:
-            rules = [
-                rule_over_ht(match),
-                rule_over_ft(match),
-                rule_next_corner(match),
-                rule_asian(match),
-                rule_team_corner(match),
-                rule_btts_corners(match),
-                rule_high_pressure(match),
-            ]
+        for m in matches:
+            fid = m["fixture"]["id"]
+            rules = apply_rules(m)
 
-            for alert in rules:
-                if alert:
-                    await bot.send_message(chat_id=CHAT_ID, text=alert)
+            # Detecta entrada
+            if rules and fid not in sent:
+                text = (
+                    f"⚽ *Entrada Detectada!*\n"
+                    f"📌 Jogo: {m['teams']['home']['name']} x {m['teams']['away']['name']}\n"
+                    f"⏱ Minuto: {m['fixture']['status']['elapsed']}\n"
+                    f"🚩 Cantos: {get_corners(m)}\n"
+                    f"📊 Estratégias ativadas:\n" + "\n".join(rules)
+                )
 
-        await asyncio.sleep(60)
+                msg = await send(text)
+                sent[fid] = msg.message_id
+
+            # Verifica fim do jogo
+            if fid in sent:
+                if m["fixture"]["status"]["short"] == "FT":
+                    total_corners = get_corners(m)
+                    tag = "✅ GREEN" if total_corners >= 10 else "❌ RED"
+
+                    final_msg = (
+                        f"🏁 *Jogo finalizado*\n"
+                        f"Total de escanteios: {total_corners}\n"
+                        f"Resultado: {tag}"
+                    )
+
+                    await edit(sent[fid], final_msg)
+                    del sent[fid]
+
+        await asyncio.sleep(20)
 
 
 if __name__ == "__main__":
