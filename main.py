@@ -1,16 +1,5 @@
+
 #!/usr/bin/env python3
-"""
-CornerBot PRO - Versão completa com checklist, sugestões inteligentes e relatórios detalhados.
-Substitua o main.py existente por este arquivo.
-
-Dependências:
-    pip install aiohttp python-telegram-bot==20.8
-
-Configure (opcional) via variáveis de ambiente:
-    API_KEY, TELEGRAM_TOKEN, CHAT_ID
-
-Ou edite diretamente as variáveis abaixo.
-"""
 
 import os
 import asyncio
@@ -21,11 +10,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import aiohttp
+from aiohttp import web
+
+# IMPORT CORRETO PARA python-telegram-bot 20+
 from telegram import Bot
 from telegram.error import TelegramError
 
 # -------------------------
-# Configurações (edite se quiser)
+# CONFIGURAÇÕES
 # -------------------------
 API_KEY = os.getenv("API_KEY", "74e372055593a55e7cbcc79df1097907")
 BASE = "https://v3.football.api-sports.io"
@@ -33,33 +25,25 @@ BASE = "https://v3.football.api-sports.io"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8239858396:AAEohsJJcgJwaCC4ioG1ZEek4HesI3NhwQ8")
 CHAT_ID = int(os.getenv("CHAT_ID", "441778236"))
 
-# Ajustáveis
-POLL_INTERVAL = 20                # segundos entre verificações
-CONCURRENT_REQUESTS = 6           # concorrência para chamadas à API
-STAT_TTL = 8                      # segundos de cache para estatísticas por jogo
-REQUEST_TIMEOUT = 12              # timeout para requests HTTP
-MAX_RETRIES = 3                   # tentativas em chamadas externas
-BACKOFF_FACTOR = 1.2              # fator para backoff exponencial
+POLL_INTERVAL = 20
+CONCURRENT_REQUESTS = 6
+STAT_TTL = 8
+REQUEST_TIMEOUT = 12
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 1.2
 
 LOG_LEVEL = logging.INFO
-
-# -------------------------
-# Logging
-# -------------------------
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("cornerbot")
 
-# -------------------------
-# Telegram bot
-# -------------------------
+# INSTÂNCIA DO BOT (FUNCIONA NO PTB 20.8)
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # -------------------------
-# Data Classes
+# DATA CLASSES
 # -------------------------
 @dataclass
 class BetSuggestion:
-    """Representa uma sugestão de aposta"""
     bet_type: str
     side: Optional[str]
     reason: str
@@ -67,11 +51,10 @@ class BetSuggestion:
     corners_at_entry_home: int
     corners_at_entry_away: int
     predicted_next_corner: Optional[str] = None
-    result: Optional[str] = None  # "GREEN" ou "RED"
+    result: Optional[str] = None
 
 @dataclass
 class MatchData:
-    """Armazena dados de uma partida monitorada"""
     fixture_id: int
     home_team: str
     away_team: str
@@ -82,22 +65,19 @@ class MatchData:
     corners_at_entry_away: int = 0
     suggestions: List[BetSuggestion] = field(default_factory=list)
     next_corner_after_entry: Optional[str] = None
-    final_corners_home: int = 0
+    final_counters_home: int = 0
     final_corners_away: int = 0
 
 # -------------------------
-# Utilitários
+# ESCAPAR HTML
 # -------------------------
 def esc_html(s: str) -> str:
-    """Escapa HTML para evitar problemas no Telegram"""
     if s is None:
         return ""
-    return (s.replace("&", "&amp;")
-             .replace("<", "&lt;")
-             .replace(">", "&gt;"))
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # -------------------------
-# Cache de estatísticas
+# CACHE DE ESTATÍSTICAS
 # -------------------------
 class StatsCache:
     def __init__(self):
@@ -108,8 +88,7 @@ class StatsCache:
         if not entry:
             return None
         ts, val = entry
-        now = asyncio.get_event_loop().time()
-        if (now - ts) > STAT_TTL:
+        if (asyncio.get_event_loop().time() - ts) > STAT_TTL:
             del self._cache[fixture_id]
             return None
         return val
@@ -117,10 +96,11 @@ class StatsCache:
     def set(self, fixture_id: int, value: Dict):
         self._cache[fixture_id] = (asyncio.get_event_loop().time(), value)
 
+
 stats_cache = StatsCache()
 
 # -------------------------
-# API Client assíncrono
+# API CLIENT
 # -------------------------
 class ApiClient:
     def __init__(self, session: aiohttp.ClientSession, api_key: str):
@@ -129,9 +109,9 @@ class ApiClient:
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
     async def _fetch_json(self, url: str, params: dict = None) -> Optional[dict]:
-        """Requisição com retries e backoff"""
         params = params or {}
         attempt = 0
+
         while attempt <= MAX_RETRIES:
             try:
                 async with self.semaphore:
@@ -139,115 +119,103 @@ class ApiClient:
                     async with self.session.get(url, headers=self.headers, params=params, timeout=timeout) as resp:
                         if resp.status >= 500 or resp.status == 429:
                             text = await resp.text()
-                            raise aiohttp.ClientResponseError(
-                                status=resp.status, request_info=resp.request_info, history=resp.history,
-                                message=f"HTTP {resp.status} - {text[:200]}"
-                            )
+                            raise aiohttp.ClientError(f"HTTP {resp.status}: {text}")
+
                         resp.raise_for_status()
                         return await resp.json()
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+
+            except Exception as e:
                 attempt += 1
                 if attempt > MAX_RETRIES:
-                    logger.exception("Erro definitivo ao acessar %s (params=%s): %s", url, params, e)
+                    logger.error(f"Erro definitivo ao acessar {url}: {e}")
                     return None
+
                 backoff = (BACKOFF_FACTOR ** attempt) + random.uniform(0, 0.5)
-                logger.warning("Erro ao acessar %s (tentativa %s/%s). Backoff %.2fs. Erro: %s",
-                               url, attempt, MAX_RETRIES, backoff, e)
+                logger.warning(f"Tentativa {attempt}/{MAX_RETRIES} falhou. Backoff {backoff:.2f}s")
                 await asyncio.sleep(backoff)
+
         return None
 
-    async def get_live(self) -> List[dict]:
+    async def get_live(self):
         url = f"{BASE}/fixtures"
-        params = {"live": "all"}
-        j = await self._fetch_json(url, params=params)
+        j = await self._fetch_json(url, {"live": "all"})
         if not j:
             return []
-        return j.get("response", []) or []
+        return j.get("response", [])
 
-    async def get_full_statistics(self, fixture_id: int) -> Dict:
-        """
-        Retorna estatísticas completas do jogo incluindo cantos, ataques, chutes, etc.
-        Usa cache para reduzir chamadas.
-        """
+    async def get_full_statistics(self, fixture_id: int):
         cached = stats_cache.get(fixture_id)
-        if cached is not None:
+        if cached:
             return cached
 
         url = f"{BASE}/fixtures/statistics"
-        params = {"fixture": fixture_id}
-        j = await self._fetch_json(url, params=params)
-        
+        j = await self._fetch_json(url, {"fixture": fixture_id})
+
         result = {
             "corners_home": 0,
             "corners_away": 0,
             "corners_total": 0,
-            "attacks_home": 0,
-            "attacks_away": 0,
-            "dangerous_attacks_home": 0,
-            "dangerous_attacks_away": 0,
-            "shots_home": 0,
-            "shots_away": 0,
-            "shots_on_target_home": 0,
-            "shots_on_target_away": 0,
-            "possession_home": 0,
-            "possession_away": 0
         }
 
         if not j:
             return result
 
-        resp = j.get("response", []) or []
-        for idx, team in enumerate(resp):
-            is_home = idx == 0
-            stats = team.get("statistics") or []
-            
-            for s in stats:
-                typ = (s.get("type") or "").lower()
-                val = s.get("value")
-                
-                try:
-                    if "corner" in typ:
-                        corners = int(val) if val else 0
-                        if is_home:
-                            result["corners_home"] = corners
-                        else:
-                            result["corners_away"] = corners
-                    elif "total attacks" in typ:
-                        if is_home:
-                            result["attacks_home"] = int(val) if val else 0
-                        else:
-                            result["attacks_away"] = int(val) if val else 0
-                    elif "dangerous attacks" in typ:
-                        if is_home:
-                            result["dangerous_attacks_home"] = int(val) if val else 0
-                        else:
-                            result["dangerous_attacks_away"] = int(val) if val else 0
-                    elif typ == "total shots":
-                        if is_home:
-                            result["shots_home"] = int(val) if val else 0
-                        else:
-                            result["shots_away"] = int(val) if val else 0
-                    elif "shots on goal" in typ or "shots on target" in typ:
-                        if is_home:
-                            result["shots_on_target_home"] = int(val) if val else 0
-                        else:
-                            result["shots_on_target_away"] = int(val) if val else 0
-                    elif "ball possession" in typ:
-                        poss_str = str(val).replace("%", "")
-                        if is_home:
-                            result["possession_home"] = int(poss_str) if poss_str else 0
-                        else:
-                            result["possession_away"] = int(poss_str) if poss_str else 0
-                except Exception:
-                    continue
+        resp = j.get("response", [])
+        if not resp:
+            return result
 
+        try:
+            home_stats = resp[0]["statistics"]
+            away_stats = resp[1]["statistics"]
+        except:
+            return result
+
+        def get_value(stats, name):
+            for s in stats:
+                if name.lower() in s["type"].lower():
+                    try:
+                        return int(str(s["value"]).replace("%", ""))
+                    except:
+                        return 0
+            return 0
+
+        result["corners_home"] = get_value(home_stats, "corner")
+        result["corners_away"] = get_value(away_stats, "corner")
         result["corners_total"] = result["corners_home"] + result["corners_away"]
-        
+
         stats_cache.set(fixture_id, result)
         return result
 
+
 # -------------------------
-# Regras de detecção
+# FUNÇÕES DE ENVIO TELEGRAM
+# -------------------------
+async def safe_send(text: str):
+    try:
+        return await bot.send_message(
+            chat_id=CHAT_ID,
+            text=text,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Erro ao enviar mensagem: {e}")
+        return None
+
+async def safe_edit(message_id: int, text: str):
+    try:
+        await bot.edit_message_text(
+            chat_id=CHAT_ID,
+            message_id=message_id,
+            text=text,
+            parse_mode="HTML"
+        )
+        return True
+    except Exception:
+        return False
+
+
+# -------------------------
+# REGRAS DE DETECÇÃO
 # -------------------------
 def apply_rules_from_values(minute: Optional[int], corners: int) -> List[str]:
     checks: List[str] = []
@@ -271,180 +239,95 @@ def apply_rules_from_values(minute: Optional[int], corners: int) -> List[str]:
 
     return checks
 
+
 # -------------------------
-# Análise inteligente
+# ANÁLISE INTELIGENTE
 # -------------------------
 class IntelligentAnalyzer:
-    """Gera checklist, sugestões e previsões"""
-    
+
     @staticmethod
     def generate_checklist(stats: Dict, minute: int) -> str:
-        """Gera checklist detalhado"""
         corners_total = stats["corners_total"]
         corners_home = stats["corners_home"]
         corners_away = stats["corners_away"]
-        
-        # Ritmo (simplificado - pode ser melhorado com histórico temporal)
-        ritmo_5min = "Alto" if corners_total >= 3 else "Médio" if corners_total >= 2 else "Baixo"
-        ritmo_10min = "Alto" if corners_total >= 5 else "Médio" if corners_total >= 3 else "Baixo"
-        
-        # Time dominante
+
+        ritmo_5 = "Alto" if corners_total >= 3 else "Médio" if corners_total >= 2 else "Baixo"
+        ritmo_10 = "Alto" if corners_total >= 5 else "Médio" if corners_total >= 3 else "Baixo"
+
         if corners_home > corners_away + 1:
             dominante = "Mandante"
         elif corners_away > corners_home + 1:
             dominante = "Visitante"
         else:
             dominante = "Equilibrado"
-        
-        # Pressão ofensiva
-        total_attacks = stats["attacks_home"] + stats["attacks_away"]
-        dangerous = stats["dangerous_attacks_home"] + stats["dangerous_attacks_away"]
-        
-        if dangerous >= 10:
-            pressao = "Alta"
-        elif dangerous >= 5:
-            pressao = "Média"
-        else:
-            pressao = "Baixa"
-        
-        # Qualidade do jogo
-        shots_total = stats["shots_home"] + stats["shots_away"]
-        if shots_total >= 10 and corners_total >= 5:
-            qualidade = "Excelente"
-        elif shots_total >= 5 and corners_total >= 3:
-            qualidade = "Boa"
-        else:
-            qualidade = "Moderada"
-        
-        # Observações
-        obs = "Jogo aberto com boas oportunidades" if dangerous >= 8 else "Jogo disputado"
-        
-        checklist = f"""📋 <b>Checklist Completo:</b>
+
+        checklist = f"""
+📋 <b>Checklist Completo:</b>
 ⏱ Minuto: {minute}'
 🚩 Cantos totais: {corners_total}
 📊 Cantos: {corners_home} (Casa) x {corners_away} (Fora)
-⚡ Ritmo últimos 5min: {ritmo_5min}
-📈 Ritmo últimos 10min: {ritmo_10min}
+⚡ Ritmo últimos 5min: {ritmo_5}
+📈 Ritmo últimos 10min: {ritmo_10}
 👑 Time dominante: {dominante}
-🎯 Pressão ofensiva: {pressao}
-⭐ Qualidade do jogo: {qualidade}
-💬 Observações: {obs}"""
-        
+"""
         return checklist
-    
+
     @staticmethod
-    def predict_next_corner_side(stats: Dict, home_team: str, away_team: str) -> Tuple[str, str]:
-        """
-        Prevê o lado do próximo escanteio
-        Retorna: (lado, motivo)
-        """
+    def predict_next_corner_side(stats: Dict, home: str, away: str):
         home_score = 0
         away_score = 0
         reasons = []
-        
-        # Ataques perigosos (peso 3)
-        dang_home = stats["dangerous_attacks_home"]
-        dang_away = stats["dangerous_attacks_away"]
-        if dang_home > dang_away:
+
+        if stats["corners_home"] > stats["corners_away"]:
             home_score += 3
-            reasons.append(f"{home_team} com mais ataques perigosos ({dang_home} vs {dang_away})")
-        elif dang_away > dang_home:
+            reasons.append(f"{home} tem mais cantos")
+        elif stats["corners_away"] > stats["corners_home"]:
             away_score += 3
-            reasons.append(f"{away_team} com mais ataques perigosos ({dang_away} vs {dang_home})")
-        
-        # Ataques totais (peso 2)
-        att_home = stats["attacks_home"]
-        att_away = stats["attacks_away"]
-        if att_home > att_away:
-            home_score += 2
-            reasons.append(f"{home_team} dominando ataques ({att_home} vs {att_away})")
-        elif att_away > att_home:
-            away_score += 2
-            reasons.append(f"{away_team} dominando ataques ({att_away} vs {att_home})")
-        
-        # Chutes (peso 2)
-        shots_home = stats["shots_home"]
-        shots_away = stats["shots_away"]
-        if shots_home > shots_away:
-            home_score += 2
-        elif shots_away > shots_home:
-            away_score += 2
-        
-        # Cantos recentes (peso 3)
-        corners_home = stats["corners_home"]
-        corners_away = stats["corners_away"]
-        if corners_home > corners_away:
-            home_score += 3
-            reasons.append(f"{home_team} já tem mais escanteios ({corners_home} vs {corners_away})")
-        elif corners_away > corners_home:
-            away_score += 3
-            reasons.append(f"{away_team} já tem mais escanteios ({corners_away} vs {corners_home})")
-        
-        # Posse (peso 1)
-        if stats["possession_home"] > 55:
-            home_score += 1
-        elif stats["possession_away"] > 55:
-            away_score += 1
-        
-        # Decisão
-        diff = abs(home_score - away_score)
-        if diff <= 2:
-            side = "Equilibrado"
-            reason = "Jogo equilibrado, ambos os times pressionando"
-        elif home_score > away_score:
-            side = "Mandante"
-            reason = " | ".join(reasons) if reasons else f"{home_team} com maior pressão ofensiva"
+            reasons.append(f"{away} tem mais cantos")
+
+        if abs(home_score - away_score) <= 1:
+            return "Equilibrado", "Jogo equilibrado"
+
+        if home_score > away_score:
+            return "Mandante", " | ".join(reasons)
         else:
-            side = "Visitante"
-            reason = " | ".join(reasons) if reasons else f"{away_team} com maior pressão ofensiva"
-        
-        return side, reason
-    
+            return "Visitante", " | ".join(reasons)
+
     @staticmethod
-    def generate_suggestions(stats: Dict, rules_hit: List[str], minute: int, 
-                           home_team: str, away_team: str) -> List[BetSuggestion]:
-        """Gera sugestões inteligentes de apostas"""
+    def generate_suggestions(stats: Dict, rules_hit: List[str], minute: int, home: str, away: str):
         suggestions = []
         corners_home = stats["corners_home"]
         corners_away = stats["corners_away"]
-        corners_total = stats["corners_total"]
-        
-        # Mock odds (podem ser ajustadas ou obtidas de outra fonte)
-        def get_mock_odd(bet_type: str) -> float:
-            odds_map = {
+        total = stats["corners_total"]
+
+        def odd(t):
+            return {
                 "Próximo Escanteio": 1.85,
                 "Cantos por equipe": 1.90,
-                "AH Asiático": 1.95,
                 "Over HT": 1.80,
                 "Over FT": 1.85,
-                "Ambos Times Cantos": 1.75
-            }
-            return odds_map.get(bet_type, 1.85)
-        
-        # Previsão do próximo escanteio
-        next_side, next_reason = IntelligentAnalyzer.predict_next_corner_side(
-            stats, home_team, away_team
-        )
-        
-        # Sugestão 1: Próximo escanteio (sempre incluir se regra 3 ou 7 ativa)
-        if any("Próximo" in r or "Pressão" in r for r in rules_hit):
+                "Ambos": 1.75
+            }.get(t, 1.85)
+
+        next_side, reason = IntelligentAnalyzer.predict_next_corner_side(stats, home, away)
+
+        if any("Próximo" in r for r in rules_hit):
             suggestions.append(BetSuggestion(
                 bet_type="Próximo Escanteio",
                 side=next_side,
-                reason=next_reason,
-                odd=get_mock_odd("Próximo Escanteio"),
+                reason=reason,
+                odd=odd("Próximo Escanteio"),
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away,
                 predicted_next_corner=next_side
             ))
-        
-        # Sugestão 2: Cantos por equipe
+
         if corners_home > corners_away:
             suggestions.append(BetSuggestion(
                 bet_type="Cantos por equipe",
                 side="Mandante",
-                reason=f"{home_team} já lidera em escanteios ({corners_home} vs {corners_away}) e mantém pressão",
-                odd=get_mock_odd("Cantos por equipe"),
+                reason=f"{home} está melhor no jogo",
+                odd=odd("Cantos por equipe"),
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
@@ -452,280 +335,188 @@ class IntelligentAnalyzer:
             suggestions.append(BetSuggestion(
                 bet_type="Cantos por equipe",
                 side="Visitante",
-                reason=f"{away_team} já lidera em escanteios ({corners_away} vs {corners_home}) e mantém pressão",
-                odd=get_mock_odd("Cantos por equipe"),
+                reason=f"{away} está melhor no jogo",
+                odd=odd("Cantos por equipe"),
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
-        
-        # Sugestão 3: AH Asiático (se mandante ou visitante domina)
-        dang_home = stats["dangerous_attacks_home"]
-        dang_away = stats["dangerous_attacks_away"]
-        
-        if dang_home > dang_away + 3 and corners_home >= corners_away:
-            suggestions.append(BetSuggestion(
-                bet_type="AH Asiático -1.5",
-                side="Mandante",
-                reason=f"{home_team} com {dang_home} ataques perigosos vs {dang_away}, dominância clara",
-                odd=get_mock_odd("AH Asiático"),
-                corners_at_entry_home=corners_home,
-                corners_at_entry_away=corners_away
-            ))
-        elif dang_away > dang_home + 3 and corners_away >= corners_home:
-            suggestions.append(BetSuggestion(
-                bet_type="AH Asiático -1.5",
-                side="Visitante",
-                reason=f"{away_team} com {dang_away} ataques perigosos vs {dang_home}, dominância clara",
-                odd=get_mock_odd("AH Asiático"),
-                corners_at_entry_home=corners_home,
-                corners_at_entry_away=corners_away
-            ))
-        
-        # Sugestão 4: Over HT
-        if minute <= 35 and corners_total >= 4:
+
+        if minute <= 35 and total >= 4:
             suggestions.append(BetSuggestion(
                 bet_type="Over HT 4.5",
                 side=None,
-                reason=f"Já temos {corners_total} escanteios no minuto {minute}, ritmo alto para atingir 5+ no HT",
-                odd=get_mock_odd("Over HT"),
+                reason="Ritmo alto para bater +4.5 HT",
+                odd=odd("Over HT"),
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
-        
-        # Sugestão 5: Over FT
-        if corners_total >= 6 and minute <= 70:
+
+        if minute <= 70 and total >= 6:
             suggestions.append(BetSuggestion(
                 bet_type="Over FT 9.5",
                 side=None,
-                reason=f"{corners_total} escanteios no minuto {minute}, projeção indica 10+ no final",
-                odd=get_mock_odd("Over FT"),
+                reason="Bom ritmo de cantos",
+                odd=odd("Over FT"),
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
-        
-        # Sugestão 6: Ambos times cantos
-        if corners_home >= 1 and corners_away >= 1:
-            suggestions.append(BetSuggestion(
-                bet_type="Ambos Times Cantos",
-                side=None,
-                reason=f"Ambos já fizeram escanteios ({corners_home} e {corners_away}), jogo aberto",
-                odd=get_mock_odd("Ambos Times Cantos"),
-                corners_at_entry_home=corners_home,
-                corners_at_entry_away=corners_away
-            ))
-        
+
         return suggestions
 
+
 # -------------------------
-# Avaliador de resultados
+# AVALIADOR DE RESULTADOS
 # -------------------------
 class ResultEvaluator:
-    """Avalia GREEN/RED para cada sugestão"""
-    
+
     @staticmethod
-    def evaluate_suggestion(suggestion: BetSuggestion, match_data: MatchData) -> str:
-        """Retorna 'GREEN' ou 'RED'"""
-        bet_type = suggestion.bet_type
-        
-        # Próximo Escanteio
-        if "Próximo" in bet_type:
-            if match_data.next_corner_after_entry is None:
-                return "RED"  # Não houve próximo escanteio
-            predicted = suggestion.predicted_next_corner
-            actual = match_data.next_corner_after_entry
+    def evaluate_suggestion(sug: BetSuggestion, md: MatchData) -> str:
+        bet = sug.bet_type
+
+        # Próximo escanteio
+        if "Próximo" in bet:
+            if md.next_corner_after_entry is None:
+                return "RED"
+            predicted = sug.predicted_next_corner
             if predicted == "Equilibrado":
-                return "GREEN"  # Aceita qualquer lado
-            return "GREEN" if predicted == actual else "RED"
-        
+                return "GREEN"
+            return "GREEN" if predicted == md.next_corner_after_entry else "RED"
+
         # Cantos por equipe
-        if "Cantos por equipe" in bet_type:
-            if suggestion.side == "Mandante":
-                return "GREEN" if match_data.final_corners_home > suggestion.corners_at_entry_home else "RED"
-            elif suggestion.side == "Visitante":
-                return "GREEN" if match_data.final_corners_away > suggestion.corners_at_entry_away else "RED"
-        
-        # AH Asiático -1.5
-        if "AH Asiático" in bet_type:
-            diff_final_home = match_data.final_corners_home - match_data.final_corners_away
-            diff_final_away = match_data.final_corners_away - match_data.final_corners_home
-            
-            if suggestion.side == "Mandante":
-                return "GREEN" if diff_final_home >= 2 else "RED"
-            elif suggestion.side == "Visitante":
-                return "GREEN" if diff_final_away >= 2 else "RED"
-        
-        # Over HT (verificar se temos dados de HT - simplificado aqui)
-        if "Over HT" in bet_type:
-            # Assumindo que entry foi antes do HT e final >= 5
-            total_final = match_data.final_corners_home + match_data.final_corners_away
-            return "GREEN" if total_final >= 5 else "RED"
-        
+        if "Cantos por equipe" in bet:
+            if sug.side == "Mandante":
+                return "GREEN" if md.final_corners_home > sug.corners_at_entry_home else "RED"
+            if sug.side == "Visitante":
+                return "GREEN" if md.final_corners_away > sug.corners_at_entry_away else "RED"
+
+        # Over HT
+        if "Over HT" in bet:
+            tot = md.final_corners_home + md.final_corners_away
+            return "GREEN" if tot >= 5 else "RED"
+
         # Over FT
-        if "Over FT" in bet_type:
-            total_final = match_data.final_corners_home + match_data.final_corners_away
-            return "GREEN" if total_final >= 10 else "RED"
-        
-        # Ambos Times Cantos
-        if "Ambos Times" in bet_type:
-            made_home = match_data.final_corners_home > suggestion.corners_at_entry_home
-            made_away = match_data.final_corners_away > suggestion.corners_at_entry_away
-            return "GREEN" if (made_home and made_away) else "RED"
-        
-        return "RED"  # Default
+        if "Over FT" in bet:
+            tot = md.final_corners_home + md.final_corners_away
+            return "GREEN" if tot >= 10 else "RED"
+
+        return "RED"
+
 
 # -------------------------
-# Helpers Telegram
+# MENSAGEM DE ENTRADA
 # -------------------------
-async def safe_send(text: str) -> Optional[dict]:
-    """Envia mensagem e retorna obj Message"""
-    try:
-        msg = await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
-        return msg
-    except TelegramError as e:
-        logger.exception("Erro ao enviar mensagem Telegram: %s", e)
-        return None
-    except Exception as e:
-        logger.exception("Erro inesperado ao enviar mensagem Telegram: %s", e)
-        return None
+def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[str], suggestions: List[BetSuggestion]) -> str:
+    home = esc_html(md.home_team)
+    away = esc_html(md.away_team)
+    league = esc_html(md.league)
 
-async def safe_edit(message_id: int, text: str) -> bool:
-    try:
-        await bot.edit_message_text(chat_id=CHAT_ID, message_id=message_id, text=text, parse_mode="HTML")
-        return True
-    except TelegramError as e:
-        logger.warning("Falha ao editar mensagem %s: %s", message_id, e)
-        return False
-    except Exception as e:
-        logger.exception("Erro inesperado ao editar mensagem %s: %s", message_id, e)
-        return False
-
-# -------------------------
-# Formatação de mensagens
-# -------------------------
-def format_entry_message(match_data: MatchData, stats: Dict, minute: int, 
-                        rules_hit: List[str], suggestions: List[BetSuggestion]) -> str:
-    """Formata mensagem completa de entrada"""
-    home = esc_html(match_data.home_team)
-    away = esc_html(match_data.away_team)
-    league = esc_html(match_data.league)
-    corners_total = stats["corners_total"]
-    
-    # Cabeçalho
     msg = f"""<b>⚽ ENTRADA DETECTADA!</b>
 
 📌 <b>Jogo:</b> {home} x {away}
 🏆 <b>Liga:</b> {league}
 ⏱ <b>Minuto:</b> {minute}'
-🚩 <b>Cantos:</b> {corners_total}
+🚩 <b>Total Cantos:</b> {stats['corners_total']}
 
-📊 <b>Estratégias ativadas:</b>
+<b>📊 Estratégias ativadas:</b>
 """
-    
-    for rule in rules_hit:
-        msg += f"{esc_html(rule)}\n"
-    
+
+    for r in rules:
+        msg += f"• {esc_html(r)}\n"
+
     msg += "\n"
-    
-    # Checklist
-    checklist = IntelligentAnalyzer.generate_checklist(stats, minute)
-    msg += f"{checklist}\n\n"
-    
-    # Sugestões
-    msg += "<b>💡 Sugestões de Apostas:</b>\n\n"
-    for idx, sug in enumerate(suggestions, 1):
-        side_text = f" ({sug.side})" if sug.side else ""
-        msg += f"<b>{idx}) {esc_html(sug.bet_type)}{side_text}</b>\n"
+    msg += IntelligentAnalyzer.generate_checklist(stats, minute)
+    msg += "\n\n<b>💡 Sugestões:</b>\n\n"
+
+    for i, sug in enumerate(suggestions, 1):
+        side = f" ({sug.side})" if sug.side else ""
+        msg += f"<b>{i}) {esc_html(sug.bet_type)}{side}</b>\n"
         msg += f"   💰 Odd: {sug.odd:.2f}\n"
         msg += f"   📝 {esc_html(sug.reason)}\n\n"
-    
-    # Link Betano
-    betano_link = f"https://br.betano.com/search/{home}%20{away}%20{league}".replace(" ", "%20")
-    msg += f'🔗 <a href="{betano_link}">Apostar na Betano</a>'
-    
+
+    search = f"{home}%20{away}".replace(" ", "%20")
+    msg += f'🔗 <a href="https://br.betano.com/search/{search}">Apostar na Betano</a>'
+
     return msg
 
-def format_final_report(match_data: MatchData) -> str:
-    """Formata relatório final com GREEN/RED"""
-    home = esc_html(match_data.home_team)
-    away = esc_html(match_data.away_team)
-    total = match_data.final_corners_home + match_data.final_corners_away
-    
+
+# -------------------------
+# RELATÓRIO FINAL
+# -------------------------
+def format_final_report(md: MatchData) -> str:
+    home = esc_html(md.home_team)
+    away = esc_html(md.away_team)
+
+    total = md.final_corners_home + md.final_corners_away
+
     msg = f"""<b>🏁 Jogo finalizado!</b>
 
 📌 <b>{home} x {away}</b>
-🚩 <b>Total de Cantos:</b> {total} ({match_data.final_corners_home} x {match_data.final_corners_away})
+🚩 <b>Total de Cantos:</b> {total} ({md.final_corners_home} x {md.final_corners_away})
 
-📊 <b>Resultados das Apostas:</b>
+<b>📊 Resultados:</b>
+"""
 
-"""
-    
-    for idx, sug in enumerate(match_data.suggestions, 1):
-        side_text = f" ({sug.side})" if sug.side else ""
-        result_emoji = "✅ GREEN" if sug.result == "GREEN" else "❌ RED"
-        msg += f"<b>{idx}) {esc_html(sug.bet_type)}{side_text}</b> — Odd: {sug.odd:.2f} → {result_emoji}\n"
-    
-    msg += f"""
-📈 <b>Relatório:</b>
-• Mandante: {match_data.final_corners_home} cantos
-• Visitante: {match_data.final_corners_away} cantos
-"""
-    
+    for i, sug in enumerate(md.suggestions, 1):
+        side = f" ({sug.side})" if sug.side else ""
+        r = "✅ GREEN" if sug.result == "GREEN" else "❌ RED"
+        msg += f"<b>{i}) {esc_html(sug.bet_type)}{side}</b> — {r}\n"
+
     return msg
 
+
 # -------------------------
-# Main loop
+# MAIN LOOP
 # -------------------------
 async def main_loop():
-    logger.info("CornerBot PRO INICIADO - monitorando jogos ao vivo...")
-    
-    # Dicionário de partidas ativas
+    logger.info("CornerBot PRO iniciado — monitorando jogos ao vivo...")
+
     active_matches: Dict[int, MatchData] = {}
-    
+
     async with aiohttp.ClientSession() as session:
         api = ApiClient(session, API_KEY)
-        
-        startup_text = "<b>🔥 CornerBot PRO INICIADO</b> – monitorando jogos ao vivo..."
-        await safe_send(startup_text)
+
+        await safe_send("<b>🔥 CornerBot PRO INICIADO</b>\nMonitorando jogos ao vivo...")
 
         while True:
             try:
                 matches = await api.get_live()
-                if not matches:
-                    logger.debug("Nenhum jogo ao vivo no momento.")
-                
+
                 for m in matches:
                     try:
-                        fid = m.get("fixture", {}).get("id")
+                        fixture = m.get("fixture", {})
+                        fid = fixture.get("id")
                         if fid is None:
                             continue
 
-                        # Minuto
-                        minute_raw = m.get("fixture", {}).get("status", {}).get("elapsed")
+                        status = fixture.get("status", {})
+                        minute_raw = status.get("elapsed")
+
                         try:
                             minute = int(minute_raw) if minute_raw is not None else None
-                        except Exception:
+                        except:
                             minute = None
 
-                        # Status do jogo
-                        status_short = m.get("fixture", {}).get("status", {}).get("short")
-                        
-                        # Estatísticas completas
+                        status_short = status.get("short", "")
+
+                        # buscar estatísticas
                         stats = await api.get_full_statistics(fid)
-                        corners_total = stats["corners_total"]
                         corners_home = stats["corners_home"]
                         corners_away = stats["corners_away"]
+                        total_corners = stats["corners_total"]
 
-                        # Verifica regras
-                        rules_hit = apply_rules_from_values(minute, corners_total)
+                        # regras
+                        rules_hit = apply_rules_from_values(minute, total_corners)
 
-                        # Se regras ativadas E ainda não enviamos entrada
+                        # -----------------------------------
+                        # 1) ENVIAR ALERTA DE ENTRADA
+                        # -----------------------------------
                         if rules_hit and fid not in active_matches:
-                            home = m.get("teams", {}).get("home", {}).get("name", "—")
-                            away = m.get("teams", {}).get("away", {}).get("name", "—")
-                            league = m.get("league", {}).get("name", "—")
-                            
-                            # Cria objeto MatchData
-                            match_data = MatchData(
+
+                            home = m["teams"]["home"]["name"]
+                            away = m["teams"]["away"]["name"]
+                            league = m["league"]["name"]
+
+                            md = MatchData(
                                 fixture_id=fid,
                                 home_team=home,
                                 away_team=away,
@@ -734,78 +525,75 @@ async def main_loop():
                                 corners_at_entry_home=corners_home,
                                 corners_at_entry_away=corners_away
                             )
-                            
-                            # Gera sugestões inteligentes
+
+                            # gerar sugestões
                             suggestions = IntelligentAnalyzer.generate_suggestions(
                                 stats, rules_hit, minute or 0, home, away
                             )
-                            match_data.suggestions = suggestions
-                            
-                            # Formata e envia mensagem completa
-                            text = format_entry_message(match_data, stats, minute or 0, rules_hit, suggestions)
-                            msg = await safe_send(text)
-                            
-                            if msg:
-                                match_data.message_id = msg.message_id
-                                active_matches[fid] = match_data
-                                logger.info("Entrada enviada (fixture=%s, message_id=%s)", fid, msg.message_id)
+                            md.suggestions = suggestions
 
-                        # Monitora próximo escanteio após entrada
+                            # formatar mensagem
+                            text = format_entry_message(
+                                md, stats, minute or 0, rules_hit, suggestions
+                            )
+
+                            msg = await safe_send(text)
+                            if msg:
+                                md.message_id = msg.message_id
+                                active_matches[fid] = md
+                                logger.info(f"Entrada enviada — fixture {fid}")
+
+                        # -----------------------------------
+                        # 2) DETECTAR PRÓXIMO ESCANTEIO
+                        # -----------------------------------
                         if fid in active_matches:
-                            match_data = active_matches[fid]
-                            
-                            # Detecta próximo escanteio
-                            if match_data.next_corner_after_entry is None:
-                                if corners_home > match_data.corners_at_entry_home:
-                                    match_data.next_corner_after_entry = "Mandante"
-                                    logger.info("Próximo escanteio foi do Mandante (fixture=%s)", fid)
-                                elif corners_away > match_data.corners_at_entry_away:
-                                    match_data.next_corner_after_entry = "Visitante"
-                                    logger.info("Próximo escanteio foi do Visitante (fixture=%s)", fid)
-                            
-                            # Jogo finalizado
-                            if status_short == "FT":
-                                # Atualiza dados finais
-                                match_data.final_corners_home = corners_home
-                                match_data.final_corners_away = corners_away
-                                
-                                # Avalia cada sugestão
-                                for sug in match_data.suggestions:
-                                    sug.result = ResultEvaluator.evaluate_suggestion(sug, match_data)
-                                
-                                # Gera relatório final
-                                final_text = format_final_report(match_data)
-                                
-                                # Tenta editar mensagem original
-                                if match_data.message_id:
-                                    edited = await safe_edit(match_data.message_id, final_text)
-                                    if edited:
-                                        logger.info("Relatório final editado (fixture=%s)", fid)
-                                    else:
-                                        # Se falhar edição, envia nova mensagem
-                                        await safe_send(final_text)
-                                        logger.info("Relatório final enviado como nova mensagem (fixture=%s)", fid)
-                                else:
-                                    await safe_send(final_text)
-                                
-                                # Remove partida dos ativos
-                                del active_matches[fid]
-                                logger.info("Partida finalizada e removida (fixture=%s)", fid)
+                            md = active_matches[fid]
+
+                            if md.next_corner_after_entry is None:
+
+                                if corners_home > md.corners_at_entry_home:
+                                    md.next_corner_after_entry = "Mandante"
+                                    logger.info(f"Próximo canto: MANDANTE — fixture {fid}")
+
+                                elif corners_away > md.corners_at_entry_away:
+                                    md.next_corner_after_entry = "Visitante"
+                                    logger.info(f"Próximo canto: VISITANTE — fixture {fid}")
+
+                        # -----------------------------------
+                        # 3) FINALIZAÇÃO DO JOGO
+                        # -----------------------------------
+                        if fid in active_matches and status_short == "FT":
+                            md = active_matches[fid]
+
+                            md.final_corners_home = corners_home
+                            md.final_corners_away = corners_away
+
+                            # GREEN/RED
+                            for sug in md.suggestions:
+                                sug.result = ResultEvaluator.evaluate_suggestion(sug, md)
+
+                            final_msg = format_final_report(md)
+
+                            # tenta editar mensagem original
+                            if md.message_id:
+                                ok = await safe_edit(md.message_id, final_msg)
+                                if not ok:
+                                    await safe_send(final_msg)
+                            else:
+                                await safe_send(final_msg)
+
+                            logger.info(f"Relatório final enviado — fixture {fid}")
+                            del active_matches[fid]
 
                     except Exception as e:
-                        logger.exception("Erro processando partida: %s", e)
+                        logger.error(f"Erro processando partida: {e}")
 
                 await asyncio.sleep(POLL_INTERVAL)
 
             except Exception as e:
-                logger.exception("Erro no loop principal: %s", e)
+                logger.error(f"Erro no loop principal: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
 
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        logger.info("CornerBot PRO interrompido pelo usuário.")
-    except Exception:
-        logger.exception("CornerBot PRO caiu por erro inesperado.")
+# -------------------------
+# KEEP-ALIVE SERVER (Railway obrigatobrigato
