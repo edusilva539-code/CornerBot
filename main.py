@@ -19,11 +19,11 @@ from telegram.error import TelegramError
 # -------------------------
 # CONFIGURAÇÕES
 # -------------------------
-API_KEY = os.getenv("API_KEY", "74e372055593a55e7cbcc79df1097907")
+API_KEY = os.environ("API_KEY", "74e372055593a55e7cbcc79df1097907")
 BASE = "https://v3.football.api-sports.io"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8239858396:AAEohsJJcgJwaCC4ioG1ZEek4HesI3NhwQ8")
-CHAT_ID = int(os.getenv("CHAT_ID", "441778236"))
+TELEGRAM_TOKEN = os.environ("TELEGRAM_TOKEN", "8239858396:AAEohsJJcgJwaCC4ioG1ZEek4HesI3NhwQ8")
+CHAT_ID = int(os.environ("CHAT_ID", "441778236"))
 
 POLL_INTERVAL = 20
 CONCURRENT_REQUESTS = 6
@@ -596,4 +596,32 @@ async def main_loop():
 
 
 # -------------------------
-# KEEP-ALIVE SERVER (Railway obrigatobrigato
+# KEEP-ALIVE SERVER (Railway precisa de porta aberta)
+# -------------------------
+async def handle(request):
+    return web.Response(text="CornerBot PRO Online")
+
+async def start_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+
+    port = int(os.environ.get("PORT", 3000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logger.info(f"Servidor keep-alive rodando na porta {port}")
+
+# -------------------------
+# BOOTSTRAP (INICIALIZAÇÃO REAL)
+# -------------------------
+async def main():
+    await start_server()
+    await main_loop()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot encerrado manualmente")
