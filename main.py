@@ -562,8 +562,17 @@ async def main_loop():
                         # -----------------------------------
                         # 3) FINALIZAÇÃO DO JOGO
                         # -----------------------------------
-                        if fid in active_matches and status_short == "FT":
+                        if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
+
                             md = active_matches[fid]
+
+                            # Aguarda a API atualizar os dados finais
+                            await asyncio.sleep(15)
+
+                            # Rebuscar estatísticas finais
+                            stats = await api.get_full_statistics(fid)
+                            corners_home = stats["corners_home"]
+                            corners_away = stats["corners_away"]
 
                             md.final_corners_home = corners_home
                             md.final_corners_away = corners_away
