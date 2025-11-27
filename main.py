@@ -19,11 +19,11 @@ from telegram.error import TelegramError
 # -------------------------
 # CONFIGURAÇÕES
 # -------------------------
-API_KEY = os.environ("API_KEY", "74e372055593a55e7cbcc79df1097907")
+API_KEY = os.getenv("API_KEY")
 BASE = "https://v3.football.api-sports.io"
 
-TELEGRAM_TOKEN = os.environ("TELEGRAM_TOKEN", "8239858396:AAEohsJJcgJwaCC4ioG1ZEek4HesI3NhwQ8")
-CHAT_ID = int(os.environ("CHAT_ID", "441778236"))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID"))
 
 POLL_INTERVAL = 20
 CONCURRENT_REQUESTS = 6
