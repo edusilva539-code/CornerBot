@@ -5,37 +5,38 @@ import logging
 import random
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime, date  # <- acrescentei date
 
 import aiohttp
 from aiohttp import web
 from telegram import Bot
 
-# -------------------------
+# =========================================================
 # CONFIGURAÇÕES
-# -------------------------
+# =========================================================
+
 API_KEY = os.getenv("API_KEY")
 BASE = "https://v3.football.api-sports.io"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID_ENV = os.getenv("CHAT_ID")
 
+if not API_KEY:
+    raise RuntimeError("API_KEY não definido no ambiente")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN não definido no ambiente")
+
 if not CHAT_ID_ENV:
     raise RuntimeError("CHAT_ID não definido no ambiente")
 
 CHAT_ID = int(CHAT_ID_ENV)
 
-# ======= AJUSTES PARA MODO ECONÔMICO (110 req/dia) =======
-POLL_INTERVAL = 900          # 15 minutos entre chamadas /fixtures
-CONCURRENT_REQUESTS = 6
-STAT_TTL = 600               # cache de stats 10 minutos
-REQUEST_TIMEOUT = 12
+POLL_INTERVAL = 20
+CONCURRENT_REQUESTS = 3
+STAT_TTL = 15
+REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
-BACKOFF_FACTOR = 1.2
-
-MAX_DAILY_REQUESTS = 110     # limite total da API por dia
-MAX_STATS_PER_DAY = 14       # limite de chamadas /fixtures/statistics
-# ==========================================================
+BACKOFF_FACTOR = 1.5
 
 LOG_LEVEL = logging.INFO
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -43,50 +44,10 @@ logger = logging.getLogger("cornerbot")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# -------------------------
-# CONTADOR DIÁRIO DE REQUISIÇÕES
-# -------------------------
-class DailyLimiter:
-    """
-    Controla quantas requisições já foram feitas no dia
-    e trava o bot quando atingir o limite da API.
-    """
-
-    def __init__(self):
-        self.day: date = date.today()
-        self.total: int = 0
-        self.stats: int = 0
-
-    def _reset_if_new_day(self):
-        hoje = date.today()
-        if hoje != self.day:
-            self.day = hoje
-            self.total = 0
-            self.stats = 0
-            logger.info("✅ Contador diário de requisições resetado")
-
-    def can_request(self) -> bool:
-        self._reset_if_new_day()
-        return self.total < MAX_DAILY_REQUESTS
-
-    def can_stats(self) -> bool:
-        self._reset_if_new_day()
-        return self.stats < MAX_STATS_PER_DAY
-
-    def inc(self, is_stats: bool = False):
-        self.total += 1
-        if is_stats:
-            self.stats += 1
-        logger.info(
-            f"📊 Requisições hoje: {self.total}/{MAX_DAILY_REQUESTS} | "
-            f"Stats: {self.stats}/{MAX_STATS_PER_DAY}"
-        )
-
-limiter = DailyLimiter()
-
-# -------------------------
+# =========================================================
 # DATA CLASSES
-# -------------------------
+# =========================================================
+
 @dataclass
 class BetSuggestion:
     bet_type: str
@@ -113,17 +74,19 @@ class MatchData:
     final_corners_home: int = 0
     final_corners_away: int = 0
 
-# -------------------------
-# ESCAPAR HTML
-# -------------------------
+# =========================================================
+# UTIL
+# =========================================================
+
 def esc_html(s: str) -> str:
     if s is None:
         return ""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-# -------------------------
-# CACHE DE ESTATÍSTICAS
-# -------------------------
+# =========================================================
+# CACHE
+# =========================================================
+
 class StatsCache:
     def __init__(self):
         self._cache: Dict[int, Tuple[float, Dict]] = {}
@@ -143,43 +106,34 @@ class StatsCache:
 
 stats_cache = StatsCache()
 
-# -------------------------
+# =========================================================
 # API CLIENT
-# -------------------------
+# =========================================================
+
 class ApiClient:
     def __init__(self, session: aiohttp.ClientSession, api_key: str):
         self.session = session
         self.headers = {"x-apisports-key": api_key}
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
-    async def _fetch_json(self, url: str, params: dict = None, *, is_stats: bool = False) -> Optional[dict]:
+    async def _fetch_json(self, url: str, params: dict = None) -> Optional[dict]:
         params = params or {}
-
-        # 🔒 respeita limite diário
-        if not limiter.can_request():
-            logger.warning("🚫 LIMITE DIÁRIO TOTAL DE REQUISIÇÕES ATINGIDO, ignorando chamada")
-            return None
-
-        if is_stats and not limiter.can_stats():
-            logger.warning("🚫 LIMITE DIÁRIO DE /statistics ATINGIDO, não vou buscar stats")
-            return None
-
         attempt = 0
+
         while attempt <= MAX_RETRIES:
             try:
                 async with self.semaphore:
                     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-                    async with self.session.get(url, headers=self.headers, params=params, timeout=timeout) as resp:
-                        if resp.status >= 500 or resp.status == 429:
+                    async with self.session.get(
+                        url, headers=self.headers, params=params, timeout=timeout
+                    ) as resp:
+
+                        if resp.status in (429, 500, 502, 503):
                             text = await resp.text()
                             raise aiohttp.ClientError(f"HTTP {resp.status}: {text}")
 
                         resp.raise_for_status()
-                        data = await resp.json()
-
-                        # conta só quando a requisição deu certo
-                        limiter.inc(is_stats=is_stats)
-                        return data
+                        return await resp.json()
 
             except Exception as e:
                 attempt += 1
@@ -195,7 +149,7 @@ class ApiClient:
 
     async def get_live(self):
         url = f"{BASE}/fixtures"
-        j = await self._fetch_json(url, {"live": "all"}, is_stats=False)
+        j = await self._fetch_json(url, {"live": "all"})
         if not j:
             return []
         return j.get("response", [])
@@ -206,19 +160,15 @@ class ApiClient:
             return cached
 
         url = f"{BASE}/fixtures/statistics"
-        j = await self._fetch_json(url, {"fixture": fixture_id}, is_stats=True)
+        j = await self._fetch_json(url, {"fixture": fixture_id})
 
-        result = {
-            "corners_home": 0,
-            "corners_away": 0,
-            "corners_total": 0,
-        }
+        result = {"corners_home": 0, "corners_away": 0, "corners_total": 0}
 
         if not j:
             return result
 
         resp = j.get("response", [])
-        if not resp:
+        if not resp or len(resp) < 2:
             return result
 
         try:
@@ -229,9 +179,9 @@ class ApiClient:
 
         def get_value(stats, name):
             for s in stats:
-                if name.lower() in s["type"].lower():
+                if name.lower() in s.get("type", "").lower():
                     try:
-                        return int(str(s["value"]).replace("%", ""))
+                        return int(str(s.get("value", 0)).replace("%", ""))
                     except Exception:
                         return 0
             return 0
@@ -243,9 +193,10 @@ class ApiClient:
         stats_cache.set(fixture_id, result)
         return result
 
-# -------------------------
+# =========================================================
 # TELEGRAM
-# -------------------------
+# =========================================================
+
 async def safe_send(text: str):
     try:
         return await bot.send_message(
@@ -270,9 +221,10 @@ async def safe_edit(message_id: int, text: str):
         logger.error(f"Erro ao editar mensagem: {e}")
         return False
 
-# -------------------------
+# =========================================================
 # REGRAS
-# -------------------------
+# =========================================================
+
 def apply_rules_from_values(minute: Optional[int], corners: int) -> List[str]:
     checks: List[str] = []
     if minute is None:
@@ -295,10 +247,12 @@ def apply_rules_from_values(minute: Optional[int], corners: int) -> List[str]:
 
     return checks
 
-# -------------------------
+# =========================================================
 # ANALISADOR
-# -------------------------
+# =========================================================
+
 class IntelligentAnalyzer:
+
     @staticmethod
     def generate_checklist(stats: Dict, minute: int) -> str:
         corners_total = stats["corners_total"]
@@ -417,10 +371,12 @@ class IntelligentAnalyzer:
 
         return suggestions
 
-# -------------------------
+# =========================================================
 # AVALIADOR
-# -------------------------
+# =========================================================
+
 class ResultEvaluator:
+
     @staticmethod
     def evaluate_suggestion(sug: BetSuggestion, md: MatchData) -> str:
         bet = sug.bet_type
@@ -428,10 +384,9 @@ class ResultEvaluator:
         if "Próximo" in bet:
             if md.next_corner_after_entry is None:
                 return "RED"
-            predicted = sug.predicted_next_corner
-            if predicted == "Equilibrado":
+            if sug.predicted_next_corner == "Equilibrado":
                 return "GREEN"
-            return "GREEN" if predicted == md.next_corner_after_entry else "RED"
+            return "GREEN" if sug.predicted_next_corner == md.next_corner_after_entry else "RED"
 
         if "Cantos por equipe" in bet:
             if sug.side == "Mandante":
@@ -440,20 +395,19 @@ class ResultEvaluator:
                 return "GREEN" if md.final_corners_away > sug.corners_at_entry_away else "RED"
 
         if "Over HT" in bet:
-            if md.entry_minute and md.entry_minute > 45:
-                return "RED"
-            tot = md.final_corners_home + md.final_corners_away
-            return "GREEN" if tot >= 5 else "RED"
+            total = md.final_corners_home + md.final_corners_away
+            return "GREEN" if total >= 5 else "RED"
 
         if "Over FT" in bet:
-            tot = md.final_corners_home + md.final_corners_away
-            return "GREEN" if tot >= 10 else "RED"
+            total = md.final_corners_home + md.final_corners_away
+            return "GREEN" if total >= 10 else "RED"
 
         return "RED"
 
-# -------------------------
+# =========================================================
 # MENSAGENS
-# -------------------------
+# =========================================================
+
 def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[str], suggestions: List[BetSuggestion]) -> str:
     home = esc_html(md.home_team)
     away = esc_html(md.away_team)
@@ -490,7 +444,6 @@ def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[st
 def format_final_report(md: MatchData) -> str:
     home = esc_html(md.home_team)
     away = esc_html(md.away_team)
-
     total = md.final_corners_home + md.final_corners_away
 
     msg = f"""<b>🏁 Jogo finalizado!</b>
@@ -508,9 +461,10 @@ def format_final_report(md: MatchData) -> str:
 
     return msg
 
-# -------------------------
+# =========================================================
 # LOOP PRINCIPAL
-# -------------------------
+# =========================================================
+
 async def main_loop():
     logger.info("CornerBot PRO iniciado — monitorando jogos ao vivo...")
 
@@ -519,7 +473,7 @@ async def main_loop():
     async with aiohttp.ClientSession() as session:
         api = ApiClient(session, API_KEY)
 
-        await safe_send("<b>🔥 CornerBot PRO INICIADO</b>\nMonitorando jogos ao vivo (modo econômico 110 req/dia)...")
+        await safe_send("<b>🔥 CornerBot PRO INICIADO</b>\nMonitorando jogos ao vivo...")
 
         while True:
             try:
@@ -529,7 +483,7 @@ async def main_loop():
                     try:
                         fixture = m.get("fixture", {})
                         fid = fixture.get("id")
-                        if fid is None:
+                        if not fid:
                             continue
 
                         status = fixture.get("status", {})
@@ -543,12 +497,14 @@ async def main_loop():
                         status_short = status.get("short", "")
 
                         stats = await api.get_full_statistics(fid)
+
                         corners_home = stats["corners_home"]
                         corners_away = stats["corners_away"]
                         total_corners = stats["corners_total"]
 
                         rules_hit = apply_rules_from_values(minute, total_corners)
 
+                        # ---------- ENTRADA ----------
                         if rules_hit and fid not in active_matches:
                             home = m["teams"]["home"]["name"]
                             away = m["teams"]["away"]["name"]
@@ -564,23 +520,18 @@ async def main_loop():
                                 corners_at_entry_away=corners_away
                             )
 
-                            suggestions = IntelligentAnalyzer.generate_suggestions(
+                            md.suggestions = IntelligentAnalyzer.generate_suggestions(
                                 stats, rules_hit, minute or 0, home, away
                             )
-                            md.suggestions = suggestions
 
-                            text = format_entry_message(
-                                md, stats, minute or 0, rules_hit, suggestions
-                            )
+                            text = format_entry_message(md, stats, minute or 0, rules_hit, md.suggestions)
 
                             msg = await safe_send(text)
                             if msg:
                                 md.message_id = msg.message_id
                                 active_matches[fid] = md
-                                logger.info(f"Entrada enviada — fixture {fid}")
-                            else:
-                                logger.warning(f"Falha ao enviar entrada — fixture {fid}")
 
+                        # ---------- PRÓXIMO CANTO ----------
                         if fid in active_matches:
                             md = active_matches[fid]
                             if md.next_corner_after_entry is None:
@@ -591,27 +542,43 @@ async def main_loop():
                                     md.next_corner_after_entry = "Visitante"
                                     md.corners_at_entry_away = corners_away
 
-                         if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
-    md = active_matches[fid]
+                        # ---------- FINALIZAÇÃO ----------
+                        if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
+                            md = active_matches[fid]
 
-    await asyncio.sleep(15)
-    stats_cache._cache.pop(fid, None)
+                            await asyncio.sleep(15)
+                            stats_cache._cache.pop(fid, None)
 
-    stats = await api.get_full_statistics(fid)
-    md.final_corners_home = stats["corners_home"]
-    md.final_corners_away = stats["corners_away"]
+                            stats = await api.get_full_statistics(fid)
+                            md.final_corners_home = stats["corners_home"]
+                            md.final_corners_away = stats["corners_away"]
 
-    for sug in md.suggestions:
-        sug.result = ResultEvaluator.evaluate_suggestion(sug, md)
+                            for sug in md.suggestions:
+                                sug.result = ResultEvaluator.evaluate_suggestion(sug, md)
 
-    final_msg = format_final_report(md)
+                            final_msg = format_final_report(md)
 
-    if md.message_id:
-        ok = await safe_edit(md.message_id, final_msg)
-        if not ok:
-            await safe_send(final_msg)
-    else:
-        await safe_send(final_msg)
+                            if md.message_id:
+                                ok = await safe_edit(md.message_id, final_msg)
+                                if not ok:
+                                    await safe_send(final_msg)
+                            else:
+                                await safe_send(final_msg)
 
-    del active_matches[fid]
-           
+                            del active_matches[fid]
+
+                    except Exception as e:
+                        logger.error(f"Erro ao processar fixture {fid}: {e}", exc_info=True)
+
+                await asyncio.sleep(POLL_INTERVAL)
+
+            except Exception as e:
+                logger.error(f"Erro no loop principal: {e}", exc_info=True)
+                await asyncio.sleep(POLL_INTERVAL)
+
+# =========================================================
+# KEEP-ALIVE
+# =========================================================
+
+async def handle(request):
+    re
