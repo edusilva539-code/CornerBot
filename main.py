@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import os
@@ -23,7 +22,12 @@ API_KEY = os.getenv("API_KEY")
 BASE = "https://v3.football.api-sports.io"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))
+CHAT_ID_ENV = os.getenv("CHAT_ID")
+
+if not CHAT_ID_ENV:
+    raise RuntimeError("CHAT_ID não definido no ambiente")
+
+CHAT_ID = int(CHAT_ID_ENV)
 
 POLL_INTERVAL = 20
 CONCURRENT_REQUESTS = 6
@@ -65,7 +69,7 @@ class MatchData:
     corners_at_entry_away: int = 0
     suggestions: List[BetSuggestion] = field(default_factory=list)
     next_corner_after_entry: Optional[str] = None
-    final_counters_home: int = 0
+    final_corners_home: int = 0   # FIX
     final_corners_away: int = 0
 
 # -------------------------
@@ -186,7 +190,6 @@ class ApiClient:
         stats_cache.set(fixture_id, result)
         return result
 
-
 # -------------------------
 # FUNÇÕES DE ENVIO TELEGRAM
 # -------------------------
@@ -210,9 +213,9 @@ async def safe_edit(message_id: int, text: str):
             parse_mode="HTML"
         )
         return True
-    except Exception:
+    except Exception as e:
+        logger.error(f"Erro ao editar mensagem: {e}")
         return False
-
 
 # -------------------------
 # REGRAS DE DETECÇÃO
@@ -221,7 +224,6 @@ def apply_rules_from_values(minute: Optional[int], corners: int) -> List[str]:
     checks: List[str] = []
     if minute is None:
         return checks
-
     if minute >= 20 and corners >= 5:
         checks.append("1️⃣ Over HT > 4.5")
     if minute >= 60 and corners >= 9:
@@ -236,15 +238,12 @@ def apply_rules_from_values(minute: Optional[int], corners: int) -> List[str]:
         checks.append("6️⃣ Ambos Times Cantos")
     if minute >= 15 and corners >= 4:
         checks.append("7️⃣ Pressão para próximo canto")
-
     return checks
-
 
 # -------------------------
 # ANÁLISE INTELIGENTE
 # -------------------------
 class IntelligentAnalyzer:
-
     @staticmethod
     def generate_checklist(stats: Dict, minute: int) -> str:
         corners_total = stats["corners_total"]
@@ -263,7 +262,7 @@ class IntelligentAnalyzer:
 
         checklist = f"""
 📋 <b>Checklist Completo:</b>
-⏱ Minuto: {minute}'
+⏱ Minuto: {minute}
 🚩 Cantos totais: {corners_total}
 📊 Cantos: {corners_home} (Casa) x {corners_away} (Fora)
 ⚡ Ritmo últimos 5min: {ritmo_5}
@@ -293,7 +292,14 @@ class IntelligentAnalyzer:
         else:
             return "Visitante", " | ".join(reasons)
 
-    @staticmethod
+# -------------------------
+# MAIN LOOP (TRECHO FINAL CORRIGIDO)
+# -------------------------
+# Apenas mostrando a parte que estava quebrada no final:
+
+                    except Exception as e:
+                        logger.error(f"Erro ao processar fixture {fid}: {e}", exc_info=True)
+            @staticmethod
     def generate_suggestions(stats: Dict, rules_hit: List[str], minute: int, home: str, away: str):
         suggestions = []
         corners_home = stats["corners_home"]
@@ -389,8 +395,10 @@ class ResultEvaluator:
             if sug.side == "Visitante":
                 return "GREEN" if md.final_corners_away > sug.corners_at_entry_away else "RED"
 
-        # Over HT
+        # Over HT (correção mínima lógica)
         if "Over HT" in bet:
+            if md.entry_minute and md.entry_minute > 45:
+                return "RED"
             tot = md.final_corners_home + md.final_corners_away
             return "GREEN" if tot >= 5 else "RED"
 
@@ -414,7 +422,7 @@ def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[st
 
 📌 <b>Jogo:</b> {home} x {away}
 🏆 <b>Liga:</b> {league}
-⏱ <b>Minuto:</b> {minute}'
+⏱ <b>Minuto:</b> {minute}
 🚩 <b>Total Cantos:</b> {stats['corners_total']}
 
 <b>📊 Estratégias ativadas:</b>
@@ -542,9 +550,11 @@ async def main_loop():
                                 md.message_id = msg.message_id
                                 active_matches[fid] = md
                                 logger.info(f"Entrada enviada — fixture {fid}")
+                            else:
+                                logger.warning(f"Falha ao enviar entrada — fixture {fid}")
 
                         # -----------------------------------
-                        # 2) DETECTAR PRÓXIMO ESCANTEIO
+                        # 2) DETECTAR PRÓXIMO ESCANTEIO (CORRIGIDO)
                         # -----------------------------------
                         if fid in active_matches:
                             md = active_matches[fid]
@@ -553,14 +563,16 @@ async def main_loop():
 
                                 if corners_home > md.corners_at_entry_home:
                                     md.next_corner_after_entry = "Mandante"
+                                    md.corners_at_entry_home = corners_home
                                     logger.info(f"Próximo canto: MANDANTE — fixture {fid}")
 
                                 elif corners_away > md.corners_at_entry_away:
                                     md.next_corner_after_entry = "Visitante"
+                                    md.corners_at_entry_away = corners_away
                                     logger.info(f"Próximo canto: VISITANTE — fixture {fid}")
 
                         # -----------------------------------
-                        # 3) FINALIZAÇÃO DO JOGO
+                        # 3) FINALIZAÇÃO DO JOGO (CACHE CORRIGIDO)
                         # -----------------------------------
                         if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
 
@@ -568,6 +580,9 @@ async def main_loop():
 
                             # Aguarda a API atualizar os dados finais
                             await asyncio.sleep(15)
+
+                            # LIMPA CACHE ANTES DO FT (FIX)
+                            stats_cache._cache.pop(fid, None)
 
                             # Rebuscar estatísticas finais
                             stats = await api.get_full_statistics(fid)
@@ -595,17 +610,17 @@ async def main_loop():
                             del active_matches[fid]
 
                     except Exception as e:
-                        logger.error(f"Erro processando partida: {e}")
+                        logger.error(f"Erro ao processar fixture {fid}: {e}", exc_info=True)
 
                 await asyncio.sleep(POLL_INTERVAL)
 
             except Exception as e:
-                logger.error(f"Erro no loop principal: {e}")
+                logger.error(f"Erro no loop principal: {e}", exc_info=True)
                 await asyncio.sleep(POLL_INTERVAL)
 
 
 # -------------------------
-# KEEP-ALIVE SERVER (Railway precisa de porta aberta)
+# KEEP-ALIVE SERVER (RAILWAY)
 # -------------------------
 async def handle(request):
     return web.Response(text="CornerBot PRO Online")
@@ -622,8 +637,9 @@ async def start_server():
 
     logger.info(f"Servidor keep-alive rodando na porta {port}")
 
+
 # -------------------------
-# BOOTSTRAP (INICIALIZAÇÃO REAL)
+# BOOTSTRAP
 # -------------------------
 async def main():
     await start_server()
