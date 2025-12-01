@@ -591,5 +591,27 @@ async def main_loop():
                                     md.next_corner_after_entry = "Visitante"
                                     md.corners_at_entry_away = corners_away
 
-                        if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
+                         if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
+    md = active_matches[fid]
+
+    await asyncio.sleep(15)
+    stats_cache._cache.pop(fid, None)
+
+    stats = await api.get_full_statistics(fid)
+    md.final_corners_home = stats["corners_home"]
+    md.final_corners_away = stats["corners_away"]
+
+    for sug in md.suggestions:
+        sug.result = ResultEvaluator.evaluate_suggestion(sug, md)
+
+    final_msg = format_final_report(md)
+
+    if md.message_id:
+        ok = await safe_edit(md.message_id, final_msg)
+        if not ok:
+            await safe_send(final_msg)
+    else:
+        await safe_send(final_msg)
+
+    del active_matches[fid]
            
