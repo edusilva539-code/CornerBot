@@ -5,7 +5,7 @@ import logging
 import random
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date  # <- acrescentei date
 
 import aiohttp
 from aiohttp import web
@@ -25,18 +25,64 @@ if not CHAT_ID_ENV:
 
 CHAT_ID = int(CHAT_ID_ENV)
 
-POLL_INTERVAL = 20
+# ======= AJUSTES PARA MODO ECONÔMICO (110 req/dia) =======
+POLL_INTERVAL = 900          # 15 minutos entre chamadas /fixtures
 CONCURRENT_REQUESTS = 6
-STAT_TTL = 8
+STAT_TTL = 600               # cache de stats 10 minutos
 REQUEST_TIMEOUT = 12
 MAX_RETRIES = 3
 BACKOFF_FACTOR = 1.2
+
+MAX_DAILY_REQUESTS = 110     # limite total da API por dia
+MAX_STATS_PER_DAY = 14       # limite de chamadas /fixtures/statistics
+# ==========================================================
 
 LOG_LEVEL = logging.INFO
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("cornerbot")
 
 bot = Bot(token=TELEGRAM_TOKEN)
+
+# -------------------------
+# CONTADOR DIÁRIO DE REQUISIÇÕES
+# -------------------------
+class DailyLimiter:
+    """
+    Controla quantas requisições já foram feitas no dia
+    e trava o bot quando atingir o limite da API.
+    """
+
+    def __init__(self):
+        self.day: date = date.today()
+        self.total: int = 0
+        self.stats: int = 0
+
+    def _reset_if_new_day(self):
+        hoje = date.today()
+        if hoje != self.day:
+            self.day = hoje
+            self.total = 0
+            self.stats = 0
+            logger.info("✅ Contador diário de requisições resetado")
+
+    def can_request(self) -> bool:
+        self._reset_if_new_day()
+        return self.total < MAX_DAILY_REQUESTS
+
+    def can_stats(self) -> bool:
+        self._reset_if_new_day()
+        return self.stats < MAX_STATS_PER_DAY
+
+    def inc(self, is_stats: bool = False):
+        self.total += 1
+        if is_stats:
+            self.stats += 1
+        logger.info(
+            f"📊 Requisições hoje: {self.total}/{MAX_DAILY_REQUESTS} | "
+            f"Stats: {self.stats}/{MAX_STATS_PER_DAY}"
+        )
+
+limiter = DailyLimiter()
 
 # -------------------------
 # DATA CLASSES
@@ -106,10 +152,19 @@ class ApiClient:
         self.headers = {"x-apisports-key": api_key}
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
-    async def _fetch_json(self, url: str, params: dict = None) -> Optional[dict]:
+    async def _fetch_json(self, url: str, params: dict = None, *, is_stats: bool = False) -> Optional[dict]:
         params = params or {}
-        attempt = 0
 
+        # 🔒 respeita limite diário
+        if not limiter.can_request():
+            logger.warning("🚫 LIMITE DIÁRIO TOTAL DE REQUISIÇÕES ATINGIDO, ignorando chamada")
+            return None
+
+        if is_stats and not limiter.can_stats():
+            logger.warning("🚫 LIMITE DIÁRIO DE /statistics ATINGIDO, não vou buscar stats")
+            return None
+
+        attempt = 0
         while attempt <= MAX_RETRIES:
             try:
                 async with self.semaphore:
@@ -120,7 +175,11 @@ class ApiClient:
                             raise aiohttp.ClientError(f"HTTP {resp.status}: {text}")
 
                         resp.raise_for_status()
-                        return await resp.json()
+                        data = await resp.json()
+
+                        # conta só quando a requisição deu certo
+                        limiter.inc(is_stats=is_stats)
+                        return data
 
             except Exception as e:
                 attempt += 1
@@ -136,7 +195,7 @@ class ApiClient:
 
     async def get_live(self):
         url = f"{BASE}/fixtures"
-        j = await self._fetch_json(url, {"live": "all"})
+        j = await self._fetch_json(url, {"live": "all"}, is_stats=False)
         if not j:
             return []
         return j.get("response", [])
@@ -147,7 +206,7 @@ class ApiClient:
             return cached
 
         url = f"{BASE}/fixtures/statistics"
-        j = await self._fetch_json(url, {"fixture": fixture_id})
+        j = await self._fetch_json(url, {"fixture": fixture_id}, is_stats=True)
 
         result = {
             "corners_home": 0,
@@ -460,7 +519,7 @@ async def main_loop():
     async with aiohttp.ClientSession() as session:
         api = ApiClient(session, API_KEY)
 
-        await safe_send("<b>🔥 CornerBot PRO INICIADO</b>\nMonitorando jogos ao vivo...")
+        await safe_send("<b>🔥 CornerBot PRO INICIADO</b>\nMonitorando jogos ao vivo (modo econômico 110 req/dia)...")
 
         while True:
             try:
@@ -533,65 +592,4 @@ async def main_loop():
                                     md.corners_at_entry_away = corners_away
 
                         if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
-                            md = active_matches[fid]
-
-                            await asyncio.sleep(15)
-                            stats_cache._cache.pop(fid, None)
-
-                            stats = await api.get_full_statistics(fid)
-                            md.final_corners_home = stats["corners_home"]
-                            md.final_corners_away = stats["corners_away"]
-
-                            for sug in md.suggestions:
-                                sug.result = ResultEvaluator.evaluate_suggestion(sug, md)
-
-                            final_msg = format_final_report(md)
-
-                            if md.message_id:
-                                ok = await safe_edit(md.message_id, final_msg)
-                                if not ok:
-                                    await safe_send(final_msg)
-                            else:
-                                await safe_send(final_msg)
-
-                            del active_matches[fid]
-
-                    except Exception as e:
-                        logger.error(f"Erro ao processar fixture {fid}: {e}", exc_info=True)
-
-                await asyncio.sleep(POLL_INTERVAL)
-
-            except Exception as e:
-                logger.error(f"Erro no loop principal: {e}", exc_info=True)
-                await asyncio.sleep(POLL_INTERVAL)
-
-# -------------------------
-# KEEP-ALIVE SERVER
-# -------------------------
-async def handle(request):
-    return web.Response(text="CornerBot PRO Online")
-
-async def start_server():
-    app = web.Application()
-    app.router.add_get("/", handle)
-
-    port = int(os.environ.get("PORT", 3000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-    logger.info(f"Servidor keep-alive rodando na porta {port}")
-
-# -------------------------
-# BOOTSTRAP
-# -------------------------
-async def main():
-    await start_server()
-    await main_loop()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot encerrado manualmente")
+           
