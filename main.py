@@ -581,4 +581,30 @@ async def main_loop():
 # =========================================================
 
 async def handle(request):
-    re
+        return web.Response(text="CornerBot PRO Online")
+
+async def start_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+
+    port = int(os.environ.get("PORT", 3000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logger.info(f"Servidor keep-alive rodando na porta {port}")
+
+# =========================================================
+# BOOTSTRAP
+# =========================================================
+
+async def main():
+  await start_server()
+  await main_loop()
+
+if __name__ == "__main__":
+   try:
+     asyncio.run(main())
+   except KeyboardInterrupt:
+     logger.info("Bot encerrado manualmente")
