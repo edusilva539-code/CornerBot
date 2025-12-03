@@ -124,9 +124,7 @@ class ApiClient:
             try:
                 async with self.semaphore:
                     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-                    async with self.session.get(
-                        url, headers=self.headers, params=params, timeout=timeout
-                    ) as resp:
+                    async with self.session.get(url, headers=self.headers, params=params, timeout=timeout) as resp:
 
                         if resp.status in (429, 500, 502, 503):
                             text = await resp.text()
@@ -171,11 +169,8 @@ class ApiClient:
         if not resp or len(resp) < 2:
             return result
 
-        try:
-            home_stats = resp[0]["statistics"]
-            away_stats = resp[1]["statistics"]
-        except Exception:
-            return result
+        home_stats = resp[0]["statistics"]
+        away_stats = resp[1]["statistics"]
 
         def get_value(stats, name):
             for s in stats:
@@ -199,30 +194,21 @@ class ApiClient:
 
 async def safe_send(text: str):
     try:
-        return await bot.send_message(
-            chat_id=CHAT_ID,
-            text=text,
-            parse_mode="HTML"
-        )
+        return await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Erro ao enviar mensagem: {e}")
         return None
 
 async def safe_edit(message_id: int, text: str):
     try:
-        await bot.edit_message_text(
-            chat_id=CHAT_ID,
-            message_id=message_id,
-            text=text,
-            parse_mode="HTML"
-        )
+        await bot.edit_message_text(chat_id=CHAT_ID, message_id=message_id, text=text, parse_mode="HTML")
         return True
     except Exception as e:
         logger.error(f"Erro ao editar mensagem: {e}")
         return False
 
 # =========================================================
-# REGRAS
+# REGRAS (MANTIDAS)
 # =========================================================
 
 def apply_rules_from_values(minute: Optional[int], corners: int, home: int = None, away: int = None) -> List[str]:
@@ -230,44 +216,37 @@ def apply_rules_from_values(minute: Optional[int], corners: int, home: int = Non
     if minute is None:
         return checks
 
-    # 1️⃣ Over HT > 4.5  → previsão do 5º canto (não depois dele)
     if 15 <= minute <= 35 and corners == 4:
         checks.append("1️⃣ Over HT > 4.5")
 
-    # 2️⃣ Over FT > 9.5 → previsão do 10º canto
     if 55 <= minute <= 75 and corners in (8, 9):
         checks.append("2️⃣ Over FT > 9.5")
 
-    # 3️⃣ Próximo Escanteio → só com domínio claro
     if minute >= 12 and corners >= 3 and home is not None and away is not None:
         if abs(home - away) >= 3:
             checks.append("3️⃣ Próximo Escanteio")
 
-    # 4️⃣ AH Asiático Cantos → só com domínio + diferença
     if minute >= 30 and home is not None and away is not None:
         if abs(home - away) >= 3 and corners >= 6:
             checks.append("4️⃣ AH asiático cantos")
 
-    # 5️⃣ Cantos por equipe → só quando um time domina
     if minute >= 25 and home is not None and away is not None:
         if abs(home - away) >= 2 and corners >= 5:
             checks.append("5️⃣ Cantos por equipe")
 
-    # 6️⃣ Ambos Times Cantos → agora CONFERE SE AMBOS TÊM CANTOS
     if minute >= 35 and home is not None and away is not None:
         if home >= 3 and away >= 3:
             checks.append("6️⃣ Ambos Times Cantos")
 
-    # 7️⃣ Pressão para próximo canto → ritmo real
     if minute >= 15 and corners >= 4:
         media = corners / max(minute, 1)
-        if media >= 0.20:  # ao menos 1 canto a cada 5 minutos
+        if media >= 0.20:
             checks.append("7️⃣ Pressão para próximo canto")
 
     return checks
 
 # =========================================================
-# ANALISADOR
+# ANALISADOR (ODDS REMOVIDAS AQUI)
 # =========================================================
 
 class IntelligentAnalyzer:
@@ -288,7 +267,7 @@ class IntelligentAnalyzer:
         else:
             dominante = "Equilibrado"
 
-        checklist = f"""
+        return f"""
 📋 <b>Checklist Completo:</b>
 ⏱ Minuto: {minute}
 🚩 Cantos totais: {corners_total}
@@ -297,28 +276,14 @@ class IntelligentAnalyzer:
 📈 Ritmo últimos 10min: {ritmo_10}
 👑 Time dominante: {dominante}
 """
-        return checklist
 
     @staticmethod
     def predict_next_corner_side(stats: Dict, home: str, away: str):
-        home_score = 0
-        away_score = 0
-        reasons = []
-
         if stats["corners_home"] > stats["corners_away"]:
-            home_score += 3
-            reasons.append(f"{home} tem mais cantos")
+            return "Mandante", f"{home} tem mais cantos"
         elif stats["corners_away"] > stats["corners_home"]:
-            away_score += 3
-            reasons.append(f"{away} tem mais cantos")
-
-        if abs(home_score - away_score) <= 1:
-            return "Equilibrado", "Jogo equilibrado"
-
-        if home_score > away_score:
-            return "Mandante", " | ".join(reasons)
-        else:
-            return "Visitante", " | ".join(reasons)
+            return "Visitante", f"{away} tem mais cantos"
+        return "Equilibrado", "Jogo equilibrado"
 
     @staticmethod
     def generate_suggestions(stats: Dict, rules_hit: List[str], minute: int, home: str, away: str):
@@ -327,15 +292,6 @@ class IntelligentAnalyzer:
         corners_away = stats["corners_away"]
         total = stats["corners_total"]
 
-        def odd(t):
-            return {
-                "Próximo Escanteio": 1.85,
-                "Cantos por equipe": 1.90,
-                "Over HT": 1.80,
-                "Over FT": 1.85,
-                "Ambos": 1.75
-            }.get(t, 1.85)
-
         next_side, reason = IntelligentAnalyzer.predict_next_corner_side(stats, home, away)
 
         if any("Próximo" in r for r in rules_hit):
@@ -343,7 +299,7 @@ class IntelligentAnalyzer:
                 bet_type="Próximo Escanteio",
                 side=next_side,
                 reason=reason,
-                odd=odd("Próximo Escanteio"),
+                odd=0.0,
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away,
                 predicted_next_corner=next_side
@@ -354,7 +310,7 @@ class IntelligentAnalyzer:
                 bet_type="Cantos por equipe",
                 side="Mandante",
                 reason=f"{home} está melhor no jogo",
-                odd=odd("Cantos por equipe"),
+                odd=0.0,
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
@@ -363,7 +319,7 @@ class IntelligentAnalyzer:
                 bet_type="Cantos por equipe",
                 side="Visitante",
                 reason=f"{away} está melhor no jogo",
-                odd=odd("Cantos por equipe"),
+                odd=0.0,
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
@@ -373,7 +329,7 @@ class IntelligentAnalyzer:
                 bet_type="Over HT 4.5",
                 side=None,
                 reason="Ritmo alto para bater +4.5 HT",
-                odd=odd("Over HT"),
+                odd=0.0,
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
@@ -383,7 +339,7 @@ class IntelligentAnalyzer:
                 bet_type="Over FT 9.5",
                 side=None,
                 reason="Bom ritmo de cantos",
-                odd=odd("Over FT"),
+                odd=0.0,
                 corners_at_entry_home=corners_home,
                 corners_at_entry_away=corners_away
             ))
@@ -391,11 +347,10 @@ class IntelligentAnalyzer:
         return suggestions
 
 # =========================================================
-# AVALIADOR
+# AVALIADOR (SEM ALTERAÇÃO)
 # =========================================================
 
 class ResultEvaluator:
-
     @staticmethod
     def evaluate_suggestion(sug: BetSuggestion, md: MatchData) -> str:
         bet = sug.bet_type
@@ -424,7 +379,7 @@ class ResultEvaluator:
         return "RED"
 
 # =========================================================
-# MENSAGENS
+# MENSAGENS (ODD REMOVIDA AQUI)
 # =========================================================
 
 def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[str], suggestions: List[BetSuggestion]) -> str:
@@ -452,7 +407,6 @@ def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[st
     for i, sug in enumerate(suggestions, 1):
         side = f" ({sug.side})" if sug.side else ""
         msg += f"<b>{i}) {esc_html(sug.bet_type)}{side}</b>\n"
-        msg += f"   💰 Odd: {sug.odd:.2f}\n"
         msg += f"   📝 {esc_html(sug.reason)}\n\n"
 
     search = f"{home}%20{away}".replace(" ", "%20")
@@ -481,7 +435,7 @@ def format_final_report(md: MatchData) -> str:
     return msg
 
 # =========================================================
-# LOOP PRINCIPAL
+# LOOP PRINCIPAL (CHAMADA DAS REGRAS CORRIGIDA)
 # =========================================================
 
 async def main_loop():
@@ -521,9 +475,10 @@ async def main_loop():
                         corners_away = stats["corners_away"]
                         total_corners = stats["corners_total"]
 
-                        rules_hit = apply_rules_from_values(minute, total_corners)
+                        rules_hit = apply_rules_from_values(
+                            minute, total_corners, corners_home, corners_away
+                        )
 
-                        # ---------- ENTRADA ----------
                         if rules_hit and fid not in active_matches:
                             home = m["teams"]["home"]["name"]
                             away = m["teams"]["away"]["name"]
@@ -543,14 +498,15 @@ async def main_loop():
                                 stats, rules_hit, minute or 0, home, away
                             )
 
-                            text = format_entry_message(md, stats, minute or 0, rules_hit, md.suggestions)
+                            text = format_entry_message(
+                                md, stats, minute or 0, rules_hit, md.suggestions
+                            )
 
                             msg = await safe_send(text)
                             if msg:
                                 md.message_id = msg.message_id
                                 active_matches[fid] = md
 
-                        # ---------- PRÓXIMO CANTO ----------
                         if fid in active_matches:
                             md = active_matches[fid]
                             if md.next_corner_after_entry is None:
@@ -561,7 +517,6 @@ async def main_loop():
                                     md.next_corner_after_entry = "Visitante"
                                     md.corners_at_entry_away = corners_away
 
-                        # ---------- FINALIZAÇÃO ----------
                         if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
                             md = active_matches[fid]
 
@@ -596,11 +551,11 @@ async def main_loop():
                 await asyncio.sleep(POLL_INTERVAL)
 
 # =========================================================
-# KEEP-ALIVE
+# KEEP ALIVE
 # =========================================================
 
 async def handle(request):
-        return web.Response(text="CornerBot PRO Online")
+    return web.Response(text="CornerBot PRO Online")
 
 async def start_server():
     app = web.Application()
@@ -616,14 +571,4 @@ async def start_server():
 
 # =========================================================
 # BOOTSTRAP
-# =========================================================
-
-async def main():
-  await start_server()
-  await main_loop()
-
-if __name__ == "__main__":
-   try:
-     asyncio.run(main())
-   except KeyboardInterrupt:
-     logger.info("Bot encerrado manualmente")
+# ====
