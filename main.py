@@ -208,7 +208,7 @@ async def safe_edit(message_id: int, text: str):
         return False
 
 # =========================================================
-# REGRAS (MANTIDAS)
+# REGRAS
 # =========================================================
 
 def apply_rules_from_values(minute: Optional[int], corners: int, home: int = None, away: int = None) -> List[str]:
@@ -246,7 +246,7 @@ def apply_rules_from_values(minute: Optional[int], corners: int, home: int = Non
     return checks
 
 # =========================================================
-# ANALISADOR (ODDS REMOVIDAS AQUI)
+# ANALISADOR
 # =========================================================
 
 class IntelligentAnalyzer:
@@ -347,7 +347,7 @@ class IntelligentAnalyzer:
         return suggestions
 
 # =========================================================
-# AVALIADOR (SEM ALTERAÇÃO)
+# AVALIADOR
 # =========================================================
 
 class ResultEvaluator:
@@ -379,63 +379,7 @@ class ResultEvaluator:
         return "RED"
 
 # =========================================================
-# MENSAGENS (ODD REMOVIDA AQUI)
-# =========================================================
-
-def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[str], suggestions: List[BetSuggestion]) -> str:
-    home = esc_html(md.home_team)
-    away = esc_html(md.away_team)
-    league = esc_html(md.league)
-
-    msg = f"""<b>⚽ ENTRADA DETECTADA!</b>
-
-📌 <b>Jogo:</b> {home} x {away}
-🏆 <b>Liga:</b> {league}
-⏱ <b>Minuto:</b> {minute}
-🚩 <b>Total Cantos:</b> {stats['corners_total']}
-
-<b>📊 Estratégias ativadas:</b>
-"""
-
-    for r in rules:
-        msg += f"• {esc_html(r)}\n"
-
-    msg += "\n"
-    msg += IntelligentAnalyzer.generate_checklist(stats, minute)
-    msg += "\n\n<b>💡 Sugestões:</b>\n\n"
-
-    for i, sug in enumerate(suggestions, 1):
-        side = f" ({sug.side})" if sug.side else ""
-        msg += f"<b>{i}) {esc_html(sug.bet_type)}{side}</b>\n"
-        msg += f"   📝 {esc_html(sug.reason)}\n\n"
-
-    search = f"{home}%20{away}".replace(" ", "%20")
-    msg += f'🔗 <a href="https://br.betano.com/search/{search}">Apostar na Betano</a>'
-
-    return msg
-
-def format_final_report(md: MatchData) -> str:
-    home = esc_html(md.home_team)
-    away = esc_html(md.away_team)
-    total = md.final_corners_home + md.final_corners_away
-
-    msg = f"""<b>🏁 Jogo finalizado!</b>
-
-📌 <b>{home} x {away}</b>
-🚩 <b>Total de Cantos:</b> {total} ({md.final_corners_home} x {md.final_corners_away})
-
-<b>📊 Resultados:</b>
-"""
-
-    for i, sug in enumerate(md.suggestions, 1):
-        side = f" ({sug.side})" if sug.side else ""
-        r = "✅ GREEN" if sug.result == "GREEN" else "❌ RED"
-        msg += f"<b>{i}) {esc_html(sug.bet_type)}{side}</b> — {r}\n"
-
-    return msg
-
-# =========================================================
-# LOOP PRINCIPAL (CHAMADA DAS REGRAS CORRIGIDA)
+# LOOP PRINCIPAL
 # =========================================================
 
 async def main_loop():
@@ -453,96 +397,43 @@ async def main_loop():
                 matches = await api.get_live()
 
                 for m in matches:
-                    try:
-                        fixture = m.get("fixture", {})
-                        fid = fixture.get("id")
-                        if not fid:
-                            continue
+                    fixture = m.get("fixture", {})
+                    fid = fixture.get("id")
+                    if not fid:
+                        continue
 
-                        status = fixture.get("status", {})
-                        minute_raw = status.get("elapsed")
+                    status = fixture.get("status", {})
+                    minute = status.get("elapsed")
+                    minute = int(minute) if minute else None
 
-                        try:
-                            minute = int(minute_raw) if minute_raw is not None else None
-                        except Exception:
-                            minute = None
+                    stats = await api.get_full_statistics(fid)
 
-                        status_short = status.get("short", "")
+                    corners_home = stats["corners_home"]
+                    corners_away = stats["corners_away"]
+                    total_corners = stats["corners_total"]
 
-                        stats = await api.get_full_statistics(fid)
+                    rules_hit = apply_rules_from_values(minute, total_corners, corners_home, corners_away)
 
-                        corners_home = stats["corners_home"]
-                        corners_away = stats["corners_away"]
-                        total_corners = stats["corners_total"]
+                    if rules_hit and fid not in active_matches:
+                        home = m["teams"]["home"]["name"]
+                        away = m["teams"]["away"]["name"]
+                        league = m["league"]["name"]
 
-                        rules_hit = apply_rules_from_values(
-                            minute, total_corners, corners_home, corners_away
-                        )
+                        md = MatchData(fid, home, away, league, None, minute, corners_home, corners_away)
+                        md.suggestions = IntelligentAnalyzer.generate_suggestions(stats, rules_hit, minute or 0, home, away)
 
-                        if rules_hit and fid not in active_matches:
-                            home = m["teams"]["home"]["name"]
-                            away = m["teams"]["away"]["name"]
-                            league = m["league"]["name"]
+                        msg = await safe_send(format_entry_message(md, stats, minute or 0, rules_hit, md.suggestions))
+                        if msg:
+                            md.message_id = msg.message_id
+                            active_matches[fid] = md
 
-                            md = MatchData(
-                                fixture_id=fid,
-                                home_team=home,
-                                away_team=away,
-                                league=league,
-                                entry_minute=minute,
-                                corners_at_entry_home=corners_home,
-                                corners_at_entry_away=corners_away
-                            )
-
-                            md.suggestions = IntelligentAnalyzer.generate_suggestions(
-                                stats, rules_hit, minute or 0, home, away
-                            )
-
-                            text = format_entry_message(
-                                md, stats, minute or 0, rules_hit, md.suggestions
-                            )
-
-                            msg = await safe_send(text)
-                            if msg:
-                                md.message_id = msg.message_id
-                                active_matches[fid] = md
-
-                        if fid in active_matches:
-                            md = active_matches[fid]
-                            if md.next_corner_after_entry is None:
-                                if corners_home > md.corners_at_entry_home:
-                                    md.next_corner_after_entry = "Mandante"
-                                    md.corners_at_entry_home = corners_home
-                                elif corners_away > md.corners_at_entry_away:
-                                    md.next_corner_after_entry = "Visitante"
-                                    md.corners_at_entry_away = corners_away
-
-                        if fid in active_matches and status_short in ("FT", "AET", "PEN", "FT_PEN"):
-                            md = active_matches[fid]
-
-                            await asyncio.sleep(15)
-                            stats_cache._cache.pop(fid, None)
-
-                            stats = await api.get_full_statistics(fid)
-                            md.final_corners_home = stats["corners_home"]
-                            md.final_corners_away = stats["corners_away"]
-
-                            for sug in md.suggestions:
-                                sug.result = ResultEvaluator.evaluate_suggestion(sug, md)
-
-                            final_msg = format_final_report(md)
-
-                            if md.message_id:
-                                ok = await safe_edit(md.message_id, final_msg)
-                                if not ok:
-                                    await safe_send(final_msg)
-                            else:
-                                await safe_send(final_msg)
-
-                            del active_matches[fid]
-
-                    except Exception as e:
-                        logger.error(f"Erro ao processar fixture {fid}: {e}", exc_info=True)
+                    if fid in active_matches:
+                        md = active_matches[fid]
+                        if md.next_corner_after_entry is None:
+                            if corners_home > md.corners_at_entry_home:
+                                md.next_corner_after_entry = "Mandante"
+                            elif corners_away > md.corners_at_entry_away:
+                                md.next_corner_after_entry = "Visitante"
 
                 await asyncio.sleep(POLL_INTERVAL)
 
@@ -551,7 +442,7 @@ async def main_loop():
                 await asyncio.sleep(POLL_INTERVAL)
 
 # =========================================================
-# KEEP ALIVE
+# KEEP-ALIVE + START
 # =========================================================
 
 async def handle(request):
@@ -560,15 +451,16 @@ async def handle(request):
 async def start_server():
     app = web.Application()
     app.router.add_get("/", handle)
-
     port = int(os.environ.get("PORT", 3000))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-
     logger.info(f"Servidor keep-alive rodando na porta {port}")
 
-# =========================================================
-# BOOTSTRAP
-# ====
+async def main():
+    await start_server()
+    await main_loop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
