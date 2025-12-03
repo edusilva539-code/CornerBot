@@ -225,25 +225,44 @@ async def safe_edit(message_id: int, text: str):
 # REGRAS
 # =========================================================
 
-def apply_rules_from_values(minute: Optional[int], corners: int) -> List[str]:
+def apply_rules_from_values(minute: Optional[int], corners: int, home: int = None, away: int = None) -> List[str]:
     checks: List[str] = []
     if minute is None:
         return checks
 
-    if minute >= 20 and corners >= 5:
+    # 1️⃣ Over HT > 4.5  → previsão do 5º canto (não depois dele)
+    if 15 <= minute <= 35 and corners == 4:
         checks.append("1️⃣ Over HT > 4.5")
-    if minute >= 60 and corners >= 9:
+
+    # 2️⃣ Over FT > 9.5 → previsão do 10º canto
+    if 55 <= minute <= 75 and corners in (8, 9):
         checks.append("2️⃣ Over FT > 9.5")
-    if minute >= 10 and corners >= 3:
-        checks.append("3️⃣ Próximo Escanteio")
-    if minute >= 30 and corners >= 6:
-        checks.append("4️⃣ AH asiático cantos")
-    if minute >= 25 and corners >= 4:
-        checks.append("5️⃣ Cantos por equipe")
-    if minute >= 35 and corners >= 7:
-        checks.append("6️⃣ Ambos Times Cantos")
+
+    # 3️⃣ Próximo Escanteio → só com domínio claro
+    if minute >= 12 and corners >= 3 and home is not None and away is not None:
+        if abs(home - away) >= 3:
+            checks.append("3️⃣ Próximo Escanteio")
+
+    # 4️⃣ AH Asiático Cantos → só com domínio + diferença
+    if minute >= 30 and home is not None and away is not None:
+        if abs(home - away) >= 3 and corners >= 6:
+            checks.append("4️⃣ AH asiático cantos")
+
+    # 5️⃣ Cantos por equipe → só quando um time domina
+    if minute >= 25 and home is not None and away is not None:
+        if abs(home - away) >= 2 and corners >= 5:
+            checks.append("5️⃣ Cantos por equipe")
+
+    # 6️⃣ Ambos Times Cantos → agora CONFERE SE AMBOS TÊM CANTOS
+    if minute >= 35 and home is not None and away is not None:
+        if home >= 3 and away >= 3:
+            checks.append("6️⃣ Ambos Times Cantos")
+
+    # 7️⃣ Pressão para próximo canto → ritmo real
     if minute >= 15 and corners >= 4:
-        checks.append("7️⃣ Pressão para próximo canto")
+        media = corners / max(minute, 1)
+        if media >= 0.20:  # ao menos 1 canto a cada 5 minutos
+            checks.append("7️⃣ Pressão para próximo canto")
 
     return checks
 
