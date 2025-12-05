@@ -283,7 +283,7 @@ class OptimizedApiClient:
     async def get_live_smart(self):
         cached = smart_cache.get_live_matches()
         if cached:
-            logger.info("✅ Cache de jogos ao vivo (economizou 1 req)")
+            logger.info("Usando cache de jogos ao vivo (economizou 1 req)")
             return cached
         
         url = f"{BASE}/fixtures"
@@ -295,7 +295,7 @@ class OptimizedApiClient:
         matches = j.get("response", [])
         filtered = [m for m in matches if is_priority_league(m.get("league", {}).get("name", ""))]
         
-        logger.info(f"🎯 {len(filtered)}/{len(matches)} jogos (ligas prioritárias)")
+        logger.info(f"Jogos filtrados: {len(filtered)}/{len(matches)} (ligas prioritárias)")
         
         smart_cache.set_live_matches(filtered)
         return filtered
@@ -575,240 +575,180 @@ class ResultEvaluator:
         if has_update and md.message_id:
             updated_msg = format_result_message(md, current_stats, minute, greens, reds, pending)
             await safe_edit(md.message_id, updated_msg)
-            logger.info(f"✅ Resultados atualizados: {greens}G {reds}R {pending}P")
+            logger.info(f"Resultados atualizados: {greens}G {reds}R {pending}P")
         
         # Marca como resultado atualizado se tudo foi avaliado
         if pending == 0 and not md.result_updated:
             md.result_updated = True
-            logger.info(f"🏁 Jogo finalizado: {md.home_team} vs {md.away_team}")
+            logger.info(f"Jogo finalizado: {md.home_team} vs {md.away_team}")
 
 # =========================================================
 # FORMATADORES DE MENSAGEM
 # =========================================================
 
 def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[str], suggestions: List[BetSuggestion]) -> str:
+    home = esc_html(md.home_team)
+    away = esc_html(md.away_team)
+    league = esc_html(md.league)
+    
     msg = f"""
-🚨 <b>ENTRADA DETECTADA</b> 🚨
+🚨 <b>ENTRADA DETECTADA!</b>
 
-⚽ <b>{esc_html(md.home_team)} vs {esc_html(md.away_team)}</b>
-🏆 {esc_html(md.league)}
+⚽ <b>{home} vs {away}</b>
+🏆 {league}
 ⏱ Minuto: {minute}'
 
-📊 <b>Escanteios na entrada:</b>
+📊 <b>Escanteios no momento:</b>
 🏠 Casa: {stats['corners_home']}
 ✈️ Fora: {stats['corners_away']}
 📈 Total: {stats['corners_total']}
 
 ✅ <b>Regras ativadas:</b>
-{chr(10).join(rules)}
-
-💡 <b>Sugestões:</b>
 """
-    for i, sug in enumerate(suggestions, 1):
-        side_txt = f" ({sug.side})" if sug.side else ""
-        msg += f"\n{i}. {sug.bet_type}{side_txt}\n   📝 {sug.reason}\n   ⏳ Status: AGUARDANDO..."
+    for r in rules:
+        msg += f"• {r}\n"
     
+    msg += "\n💡 <b>Sugestões de apostas:</b>\n"
+    for sug in suggestions:
+        side_text = f" ({sug.side})" if sug.side else ""
+        msg += f"• {sug.bet_type}{side_text}\n  📝 {sug.reason}\n"
+    
+    msg += "\n⏳ Acompanhando resultado..."
     return msg
 
 def format_result_message(md: MatchData, stats: Dict, minute: int, greens: int, reds: int, pending: int) -> str:
+    home = esc_html(md.home_team)
+    away = esc_html(md.away_team)
+    league = esc_html(md.league)
+    
     msg = f"""
-🎯 <b>ATUALIZAÇÃO DE RESULTADO</b>
+📊 <b>ATUALIZAÇÃO DE RESULTADO</b>
 
-⚽ <b>{esc_html(md.home_team)} vs {esc_html(md.away_team)}</b>
-🏆 {esc_html(md.league)}
-⏱ Minuto atual: {minute}'
+⚽ <b>{home} vs {away}</b>
+🏆 {league}
+⏱ Minuto: {minute}'
 
 📊 <b>Escanteios atuais:</b>
-🏠 Casa: {stats['corners_home']} (entrada: {md.corners_at_entry_home})
-✈️ Fora: {stats['corners_away']} (entrada: {md.corners_at_entry_away})
+🏠 Casa: {stats['corners_home']}
+✈️ Fora: {stats['corners_away']}
 📈 Total: {stats['corners_total']}
 
-💡 <b>Resultados das Sugestões:</b>
+📊 <b>Entrada em {md.entry_minute}':</b>
+🏠 Casa: {md.corners_at_entry_home}
+✈️ Fora: {md.corners_at_entry_away}
+
+🎯 <b>Resultado das sugestões:</b>
 """
     
-    for i, sug in enumerate(md.suggestions, 1):
-        side_txt = f" ({sug.side})" if sug.side else ""
-        
+    for sug in md.suggestions:
         if sug.result == "GREEN":
             emoji = "✅"
-            status = "GREEN ✅"
         elif sug.result == "RED":
             emoji = "❌"
-            status = "RED ❌"
         else:
             emoji = "⏳"
-            status = "AGUARDANDO..."
         
-        msg += f"\n{emoji} {i}. {sug.bet_type}{side_txt}\n   📝 {sug.reason}\n   🎯 Status: <b>{status}</b>\n"
+        side_text = f" ({sug.side})" if sug.side else ""
+        msg += f"{emoji} {sug.bet_type}{side_text}\n"
     
-    # Resumo
-    msg += f"""
-━━━━━━━━━━━━━━━━━━━━
-📊 <b>Resumo:</b>
-✅ Greens: {greens}
-❌ Reds: {reds}
-⏳ Pendentes: {pending}
-"""
-    
-    if pending == 0:
-        winrate = (greens / (greens + reds) * 100) if (greens + reds) > 0 else 0
-        msg += f"\n🏁 <b>JOGO FINALIZADO</b>\n📈 Taxa de acerto: {winrate:.1f}%"
+    msg += f"\n📈 <b>Resumo:</b> {greens} GREEN | {reds} RED | {pending} PENDENTE"
     
     return msg
 
 # =========================================================
-# LOOP PRINCIPAL OTIMIZADO
+# LOOP PRINCIPAL
 # =========================================================
 
 async def main_loop():
-    logger.info("🚀 CornerBot PRO OTIMIZADO COM RESULTADOS iniciado")
-    logger.info(f"📊 Limite: 110 requisições/dia")
-    logger.info(f"🎯 Ligas prioritárias: {len(PRIORITY_LEAGUES)}")
-
     active_matches: Dict[int, MatchData] = {}
     cycles_count = 0
-
+    
     async with aiohttp.ClientSession() as session:
-        api = OptimizedApiClient(session, API_KEY)
-
-        await safe_send(
-    f"<b>🔥 CornerBot PRO - Sistema de Resultados Ativo</b>\n\n"
-    f"✅ Sistema iniciado\n"
-    f"📊 Limite: 110 req/dia\n"
-    f"🎯 {len(PRIORITY_LEAGUES)} ligas prioritárias\n"
-    f"⏰ Intervalo dinâmico\n"
-    f"🎲 Avaliação automática de resultados\n\n"
-    f"<i>O bot agora mostra Green/Red automaticamente!</i>"
-)
-</b>
-
-✅ Sistema iniciado
-📊 Limite: 110 req/dia
-🎯 {len(PRIORITY_LEAGUES)} ligas prioritárias
-⏰ Intervalo dinâmico
-🎲 Avaliação automática de resultados
-
-<i>O bot agora mostra Green/Red automaticamente!</i>
-""")
-
+        client = OptimizedApiClient(session, API_KEY)
+        
+        logger.info("Sistema iniciado!")
+        await safe_send("Sistema iniciado com sucesso!")
+        
         while True:
             try:
                 cycles_count += 1
                 current_interval = get_current_interval()
                 
-                logger.info(f"\n{'='*60}")
-                logger.info(f"🔄 Ciclo #{cycles_count} - {datetime.now().strftime('%H:%M:%S')}")
-                logger.info(f"⏰ Próximo em {current_interval}s")
-                logger.info(req_counter.get_stats())
+                logger.info(f"Ciclo #{cycles_count} - Intervalo: {current_interval}s")
                 
-                if not req_counter.can_request():
-                    logger.warning("⚠️ Limite diário atingido. Aguardando...")
-                    await asyncio.sleep(3600)
-                    continue
-
-                # Busca jogos
-                matches = await api.get_live_smart()
+                live_matches = await client.get_live_smart()
                 
-                if not matches:
-                    logger.info("📭 Nenhum jogo nas ligas prioritárias")
-                    
-                    # Atualiza jogos ativos mesmo sem novos jogos
-                    for fid, md in list(active_matches.items()):
-                        if not md.is_finished and req_counter.can_request():
-                            stats = await api.get_full_statistics(fid)
-                            # Tenta obter minuto atual (pode não estar mais ao vivo)
-                            minute = md.entry_minute or 90
-                            await ResultEvaluator.update_match_results(md, stats, minute)
-                    
+                if not live_matches:
+                    logger.info("Nenhum jogo ao vivo no momento")
                     await asyncio.sleep(current_interval)
                     continue
                 
-                logger.info(f"⚽ {len(matches)} jogos monitorados")
+                logger.info(f"Analisando {len(live_matches)} jogos ao vivo...")
                 
-                # Processa jogos
-                for m in matches:
-                    if not req_counter.can_request():
-                        logger.warning("⚠️ Limite durante ciclo")
-                        break
-                    
-                    fixture = m.get("fixture", {})
-                    fid = fixture.get("id")
-                    if not fid:
-                        continue
-
-                    status = fixture.get("status", {})
-                    status_short = status.get("short", "")
-                    minute = status.get("elapsed")
-                    minute = int(minute) if minute else None
-                    
-                    # Detecta jogo finalizado
-                    if status_short in ("FT", "AET", "PEN") and fid in active_matches:
-                        md = active_matches[fid]
-                        if not md.is_finished:
-                            md.is_finished = True
-                            stats = await api.get_full_statistics(fid)
-                            md.final_corners_home = stats["corners_home"]
-                            md.final_corners_away = stats["corners_away"]
-                            await ResultEvaluator.update_match_results(md, stats, 90)
-                            logger.info(f"🏁 Jogo finalizado: {md.home_team} vs {md.away_team}")
-                        continue
-                    
-                    if not minute or minute < 10:
-                        continue
-
-                    # Busca stats
-                    stats = await api.get_full_statistics(fid)
-                    
-                    corners_home = stats["corners_home"]
-                    corners_away = stats["corners_away"]
-                    total_corners = stats["corners_total"]
-                    
-                    # Detecta intervalo (HT)
-                    if status_short == "HT" and fid in active_matches:
-                        md = active_matches[fid]
-                        if md.half_time_corners is None:
-                            md.half_time_corners = total_corners
-                            await ResultEvaluator.update_match_results(md, stats, 45)
-
-                    # Aplica regras para novas entradas
-                    rules_hit = apply_rules_from_values(minute, total_corners, corners_home, corners_away)
-
-                    # Nova entrada
-                    if rules_hit and fid not in active_matches:
-                        home = m["teams"]["home"]["name"]
-                        away = m["teams"]["away"]["name"]
-                        league = m["league"]["name"]
-
-                        md = MatchData(fid, home, away, league, None, minute, corners_home, corners_away)
-                        md.suggestions = IntelligentAnalyzer.generate_suggestions(
-                            stats, rules_hit, minute, home, away
-                        )
-
-                        msg_text = format_entry_message(md, stats, minute, rules_hit, md.suggestions)
-                        msg = await safe_send(msg_text)
+                for m in live_matches:
+                    try:
+                        fid = m["fixture"]["id"]
+                        minute = m["fixture"]["status"].get("elapsed")
                         
-                        if msg:
-                            md.message_id = msg.message_id
-                            active_matches[fid] = md
-                            bot_stats.add_entry()
-                            logger.info(f"🎯 ENTRADA: {home} vs {away} ({minute}') - {len(rules_hit)} regras")
-
-                    # Atualiza jogos ativos
-                    if fid in active_matches:
-                        md = active_matches[fid]
+                        if minute is None or minute < 10:
+                            continue
                         
-                        # Detecta próximo escanteio após entrada
-                        if md.next_corner_after_entry is None:
-                            if corners_home > md.corners_at_entry_home:
-                                md.next_corner_after_entry = "Mandante"
-                                logger.info(f"🚩 Próximo escanteio: Mandante")
-                            elif corners_away > md.corners_at_entry_away:
-                                md.next_corner_after_entry = "Visitante"
-                                logger.info(f"🚩 Próximo escanteio: Visitante")
+                        status = m["fixture"]["status"]["short"]
+                        if status in ("FT", "AET", "PEN"):
+                            if fid in active_matches:
+                                active_matches[fid].is_finished = True
+                                active_matches[fid].final_corners_home = m.get("score", {}).get("home")
+                                active_matches[fid].final_corners_away = m.get("score", {}).get("away")
+                            continue
                         
-                        # Atualiza resultados
-                        await ResultEvaluator.update_match_results(md, stats, minute)
-
+                        stats = await client.get_full_statistics(fid)
+                        corners_home = stats["corners_home"]
+                        corners_away = stats["corners_away"]
+                        total_corners = stats["corners_total"]
+                        
+                        # Aplica regras para novas entradas
+                        rules_hit = apply_rules_from_values(minute, total_corners, corners_home, corners_away)
+                        
+                        # Nova entrada
+                        if rules_hit and fid not in active_matches:
+                            home = m["teams"]["home"]["name"]
+                            away = m["teams"]["away"]["name"]
+                            league = m["league"]["name"]
+                            
+                            md = MatchData(fid, home, away, league, None, minute, corners_home, corners_away)
+                            md.suggestions = IntelligentAnalyzer.generate_suggestions(
+                                stats, rules_hit, minute, home, away
+                            )
+                            
+                            msg_text = format_entry_message(md, stats, minute, rules_hit, md.suggestions)
+                            msg = await safe_send(msg_text)
+                            
+                            if msg:
+                                md.message_id = msg.message_id
+                                active_matches[fid] = md
+                                bot_stats.add_entry()
+                                logger.info(f"ENTRADA: {home} vs {away} ({minute}') - {len(rules_hit)} regras")
+                        
+                        # Atualiza jogos ativos
+                        if fid in active_matches:
+                            md = active_matches[fid]
+                            
+                            # Detecta próximo escanteio após entrada
+                            if md.next_corner_after_entry is None:
+                                if corners_home > md.corners_at_entry_home:
+                                    md.next_corner_after_entry = "Mandante"
+                                    logger.info(f"Próximo escanteio: Mandante")
+                                elif corners_away > md.corners_at_entry_away:
+                                    md.next_corner_after_entry = "Visitante"
+                                    logger.info(f"Próximo escanteio: Visitante")
+                            
+                            # Atualiza resultados
+                            await ResultEvaluator.update_match_results(md, stats, minute)
+                    
+                    except Exception as e:
+                        logger.error(f"Erro ao processar jogo {m.get('fixture', {}).get('id')}: {e}")
+                        continue
+                
                 # Remove jogos já finalizados e avaliados (após 5 minutos)
                 to_remove = []
                 for fid, md in active_matches.items():
@@ -817,21 +757,21 @@ async def main_loop():
                 
                 for fid in to_remove:
                     del active_matches[fid]
-                    logger.info(f"🗑️ Removido jogo finalizado: {fid}")
-
+                    logger.info(f"Removido jogo finalizado: {fid}")
+                
                 # Relatório periódico
                 if cycles_count % 10 == 0:
                     report = f"""
 {req_counter.get_stats()}
 {bot_stats.get_summary()}
-🔄 Ciclo #{cycles_count}
+Ciclo: #{cycles_count}
 """
                     await safe_send(report)
-
+                
                 await asyncio.sleep(current_interval)
-
+                
             except Exception as e:
-                logger.error(f"❌ Erro no loop principal: {e}", exc_info=True)
+                logger.error(f"Erro no loop principal: {e}", exc_info=True)
                 await asyncio.sleep(current_interval)
 
 # =========================================================
@@ -856,7 +796,7 @@ async def start_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"🌐 Servidor keep-alive na porta {port}")
+    logger.info(f"Servidor keep-alive na porta {port}")
 
 async def main():
     await start_server()
