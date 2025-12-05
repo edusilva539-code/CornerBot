@@ -3,15 +3,17 @@ import os
 import asyncio
 import logging
 import random
+import json
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 import aiohttp
 from aiohttp import web
 from telegram import Bot
 
 # =========================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES OTIMIZADAS
 # =========================================================
 
 API_KEY = os.getenv("API_KEY")
@@ -20,29 +22,72 @@ BASE = "https://v3.football.api-sports.io"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID_ENV = os.getenv("CHAT_ID")
 
-if not API_KEY:
-    raise RuntimeError("API_KEY não definido no ambiente")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN não definido no ambiente")
-
-if not CHAT_ID_ENV:
-    raise RuntimeError("CHAT_ID não definido no ambiente")
+if not API_KEY or not TELEGRAM_TOKEN or not CHAT_ID_ENV:
+    raise RuntimeError("Variáveis de ambiente não definidas")
 
 CHAT_ID = int(CHAT_ID_ENV)
 
-POLL_INTERVAL = 20
-CONCURRENT_REQUESTS = 3
-STAT_TTL = 15
-REQUEST_TIMEOUT = 15
-MAX_RETRIES = 3
-BACKOFF_FACTOR = 1.5
+# ESTRATÉGIA: Dividir o dia em janelas de monitoramento
+# Horários de pico de jogos: 14h-17h e 19h-23h (horário BR)
+PEAK_HOURS = [(14, 17), (19, 23)]
+
+# Intervalos inteligentes
+POLL_INTERVAL_PEAK = 180      # 3 min nos horários de pico (20 req/hora máx)
+POLL_INTERVAL_NORMAL = 600    # 10 min fora de pico (6 req/hora)
+POLL_INTERVAL_LOW = 1800      # 30 min madrugada (2 req/hora)
+
+CONCURRENT_REQUESTS = 2
+STAT_TTL = 300  # 5 minutos de cache (era 15seg!)
+REQUEST_TIMEOUT = 20
+MAX_RETRIES = 2
+BACKOFF_FACTOR = 2
+
+# Ligas prioritárias (focar nas melhores)
+PRIORITY_LEAGUES = [
+    "Premier League", "LaLiga", "Serie A", "Bundesliga", 
+    "Ligue 1", "Champions League", "Europa League",
+    "Brasileirão Série A", "Championship", "Eredivisie"
+]
 
 LOG_LEVEL = logging.INFO
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("cornerbot")
 
 bot = Bot(token=TELEGRAM_TOKEN)
+
+# =========================================================
+# CONTADOR DE REQUISIÇÕES
+# =========================================================
+
+class RequestCounter:
+    def __init__(self, daily_limit=110):
+        self.daily_limit = daily_limit
+        self.count = 0
+        self.last_reset = datetime.now().date()
+        self.history = []
+        
+    def can_request(self) -> bool:
+        self._check_reset()
+        return self.count < self.daily_limit
+    
+    def increment(self):
+        self._check_reset()
+        self.count += 1
+        self.history.append(datetime.now())
+        logger.info(f"📊 Requisições hoje: {self.count}/{self.daily_limit} ({self.daily_limit - self.count} restantes)")
+    
+    def _check_reset(self):
+        today = datetime.now().date()
+        if today > self.last_reset:
+            logger.info(f"🔄 Reset diário: {self.count} requisições usadas ontem")
+            self.count = 0
+            self.last_reset = today
+            self.history = []
+    
+    def get_stats(self) -> str:
+        return f"📊 {self.count}/{self.daily_limit} req usadas hoje ({self.daily_limit - self.count} restantes)"
+
+req_counter = RequestCounter()
 
 # =========================================================
 # DATA CLASSES
@@ -73,6 +118,69 @@ class MatchData:
     next_corner_after_entry: Optional[str] = None
     final_corners_home: int = 0
     final_corners_away: int = 0
+    last_check: float = 0
+
+# =========================================================
+# CACHE PERSISTENTE
+# =========================================================
+
+class SmartCache:
+    def __init__(self):
+        self._stats_cache: Dict[int, Tuple[float, Dict]] = {}
+        self._live_cache: Optional[Tuple[float, List]] = None
+        self._live_cache_ttl = 120  # Cache de jogos ao vivo: 2 minutos
+        
+    def get_stats(self, fixture_id: int) -> Optional[Dict]:
+        entry = self._stats_cache.get(fixture_id)
+        if not entry:
+            return None
+        ts, val = entry
+        if (asyncio.get_event_loop().time() - ts) > STAT_TTL:
+            del self._stats_cache[fixture_id]
+            return None
+        return val
+    
+    def set_stats(self, fixture_id: int, value: Dict):
+        self._stats_cache[fixture_id] = (asyncio.get_event_loop().time(), value)
+    
+    def get_live_matches(self) -> Optional[List]:
+        if not self._live_cache:
+            return None
+        ts, matches = self._live_cache
+        if (asyncio.get_event_loop().time() - ts) > self._live_cache_ttl:
+            self._live_cache = None
+            return None
+        return matches
+    
+    def set_live_matches(self, matches: List):
+        self._live_cache = (asyncio.get_event_loop().time(), matches)
+
+smart_cache = SmartCache()
+
+# =========================================================
+# GERENCIADOR DE HORÁRIOS
+# =========================================================
+
+def get_current_interval() -> int:
+    """Retorna intervalo baseado no horário (UTC-4 Manaus)"""
+    now = datetime.now()
+    hour = now.hour
+    
+    # Madrugada (0h-6h): muito lento
+    if 0 <= hour < 6:
+        return POLL_INTERVAL_LOW
+    
+    # Horários de pico
+    for start, end in PEAK_HOURS:
+        if start <= hour <= end:
+            return POLL_INTERVAL_PEAK
+    
+    # Horário normal
+    return POLL_INTERVAL_NORMAL
+
+def is_priority_league(league_name: str) -> bool:
+    """Verifica se é liga prioritária"""
+    return any(pl.lower() in league_name.lower() for pl in PRIORITY_LEAGUES)
 
 # =========================================================
 # UTIL
@@ -84,39 +192,20 @@ def esc_html(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # =========================================================
-# CACHE
+# API CLIENT OTIMIZADO
 # =========================================================
 
-class StatsCache:
-    def __init__(self):
-        self._cache: Dict[int, Tuple[float, Dict]] = {}
-
-    def get(self, fixture_id: int) -> Optional[Dict]:
-        entry = self._cache.get(fixture_id)
-        if not entry:
-            return None
-        ts, val = entry
-        if (asyncio.get_event_loop().time() - ts) > STAT_TTL:
-            del self._cache[fixture_id]
-            return None
-        return val
-
-    def set(self, fixture_id: int, value: Dict):
-        self._cache[fixture_id] = (asyncio.get_event_loop().time(), value)
-
-stats_cache = StatsCache()
-
-# =========================================================
-# API CLIENT
-# =========================================================
-
-class ApiClient:
+class OptimizedApiClient:
     def __init__(self, session: aiohttp.ClientSession, api_key: str):
         self.session = session
         self.headers = {"x-apisports-key": api_key}
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
     async def _fetch_json(self, url: str, params: dict = None) -> Optional[dict]:
+        if not req_counter.can_request():
+            logger.warning("⚠️ LIMITE DIÁRIO ATINGIDO! Aguardando reset...")
+            return None
+        
         params = params or {}
         attempt = 0
 
@@ -125,7 +214,9 @@ class ApiClient:
                 async with self.semaphore:
                     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                     async with self.session.get(url, headers=self.headers, params=params, timeout=timeout) as resp:
-
+                        
+                        req_counter.increment()  # Contabiliza requisição
+                        
                         if resp.status in (429, 500, 502, 503):
                             text = await resp.text()
                             raise aiohttp.ClientError(f"HTTP {resp.status}: {text}")
@@ -139,22 +230,41 @@ class ApiClient:
                     logger.error(f"Erro definitivo ao acessar {url}: {e}")
                     return None
 
-                backoff = (BACKOFF_FACTOR ** attempt) + random.uniform(0, 0.5)
+                backoff = (BACKOFF_FACTOR ** attempt) + random.uniform(0, 1)
                 logger.warning(f"Tentativa {attempt}/{MAX_RETRIES} falhou. Backoff {backoff:.2f}s")
                 await asyncio.sleep(backoff)
 
         return None
 
-    async def get_live(self):
+    async def get_live_smart(self):
+        """Busca jogos ao vivo com cache e filtros"""
+        # Tenta cache primeiro
+        cached = smart_cache.get_live_matches()
+        if cached:
+            logger.info("✅ Usando cache de jogos ao vivo (economizou 1 requisição)")
+            return cached
+        
         url = f"{BASE}/fixtures"
         j = await self._fetch_json(url, {"live": "all"})
+        
         if not j:
             return []
-        return j.get("response", [])
+        
+        matches = j.get("response", [])
+        
+        # Filtra apenas ligas prioritárias
+        filtered = [m for m in matches if is_priority_league(m.get("league", {}).get("name", ""))]
+        
+        logger.info(f"🎯 {len(filtered)}/{len(matches)} jogos filtrados (ligas prioritárias)")
+        
+        smart_cache.set_live_matches(filtered)
+        return filtered
 
     async def get_full_statistics(self, fixture_id: int):
-        cached = stats_cache.get(fixture_id)
+        # Cache primeiro
+        cached = smart_cache.get_stats(fixture_id)
         if cached:
+            logger.info(f"✅ Stats em cache para fixture {fixture_id}")
             return cached
 
         url = f"{BASE}/fixtures/statistics"
@@ -185,7 +295,7 @@ class ApiClient:
         result["corners_away"] = get_value(away_stats, "corner")
         result["corners_total"] = result["corners_home"] + result["corners_away"]
 
-        stats_cache.set(fixture_id, result)
+        smart_cache.set_stats(fixture_id, result)
         return result
 
 # =========================================================
@@ -208,7 +318,7 @@ async def safe_edit(message_id: int, text: str):
         return False
 
 # =========================================================
-# REGRAS
+# REGRAS (SEM ALTERAÇÃO)
 # =========================================================
 
 def apply_rules_from_values(minute: Optional[int], corners: int, home: int = None, away: int = None) -> List[str]:
@@ -246,11 +356,10 @@ def apply_rules_from_values(minute: Optional[int], corners: int, home: int = Non
     return checks
 
 # =========================================================
-# ANALISADOR
+# ANALISADOR (SEM ALTERAÇÃO)
 # =========================================================
 
 class IntelligentAnalyzer:
-
     @staticmethod
     def generate_checklist(stats: Dict, minute: int) -> str:
         corners_total = stats["corners_total"]
@@ -347,56 +456,90 @@ class IntelligentAnalyzer:
         return suggestions
 
 # =========================================================
-# AVALIADOR
+# FORMATADOR DE MENSAGEM
 # =========================================================
 
-class ResultEvaluator:
-    @staticmethod
-    def evaluate_suggestion(sug: BetSuggestion, md: MatchData) -> str:
-        bet = sug.bet_type
+def format_entry_message(md: MatchData, stats: Dict, minute: int, rules: List[str], suggestions: List[BetSuggestion]) -> str:
+    msg = f"""
+🚨 <b>ENTRADA DETECTADA</b> 🚨
 
-        if "Próximo" in bet:
-            if md.next_corner_after_entry is None:
-                return "RED"
-            if sug.predicted_next_corner == "Equilibrado":
-                return "GREEN"
-            return "GREEN" if sug.predicted_next_corner == md.next_corner_after_entry else "RED"
+⚽ <b>{esc_html(md.home_team)} vs {esc_html(md.away_team)}</b>
+🏆 {esc_html(md.league)}
+⏱ Minuto: {minute}'
 
-        if "Cantos por equipe" in bet:
-            if sug.side == "Mandante":
-                return "GREEN" if md.final_corners_home > sug.corners_at_entry_home else "RED"
-            if sug.side == "Visitante":
-                return "GREEN" if md.final_corners_away > sug.corners_at_entry_away else "RED"
+📊 <b>Escanteios:</b>
+🏠 Casa: {stats['corners_home']}
+✈️ Fora: {stats['corners_away']}
+📈 Total: {stats['corners_total']}
 
-        if "Over HT" in bet:
-            total = md.final_corners_home + md.final_corners_away
-            return "GREEN" if total >= 5 else "RED"
+✅ <b>Regras ativadas:</b>
+{chr(10).join(rules)}
 
-        if "Over FT" in bet:
-            total = md.final_corners_home + md.final_corners_away
-            return "GREEN" if total >= 10 else "RED"
-
-        return "RED"
+💡 <b>Sugestões:</b>
+"""
+    for i, sug in enumerate(suggestions, 1):
+        side_txt = f" ({sug.side})" if sug.side else ""
+        msg += f"\n{i}. {sug.bet_type}{side_txt}\n   📝 {sug.reason}"
+    
+    return msg
 
 # =========================================================
-# LOOP PRINCIPAL
+# LOOP PRINCIPAL OTIMIZADO
 # =========================================================
 
 async def main_loop():
-    logger.info("CornerBot PRO iniciado — monitorando jogos ao vivo...")
+    logger.info("🚀 CornerBot PRO OTIMIZADO iniciado")
+    logger.info(f"📊 Limite: 110 requisições/dia")
+    logger.info(f"🎯 Ligas prioritárias: {len(PRIORITY_LEAGUES)}")
 
     active_matches: Dict[int, MatchData] = {}
+    cycles_count = 0
 
     async with aiohttp.ClientSession() as session:
-        api = ApiClient(session, API_KEY)
+        api = OptimizedApiClient(session, API_KEY)
 
-        await safe_send("<b>🔥 CornerBot PRO INICIADO</b>\nMonitorando jogos ao vivo...")
+        await safe_send(f"""
+<b>🔥 CornerBot PRO OTIMIZADO</b>
+
+✅ Sistema iniciado
+📊 Limite: 110 req/dia
+🎯 Focando em {len(PRIORITY_LEAGUES)} ligas prioritárias
+⏰ Intervalo dinâmico por horário
+
+<i>Economia inteligente de requisições ativa!</i>
+""")
 
         while True:
             try:
-                matches = await api.get_live()
+                cycles_count += 1
+                current_interval = get_current_interval()
+                
+                logger.info(f"\n{'='*60}")
+                logger.info(f"🔄 Ciclo #{cycles_count} - {datetime.now().strftime('%H:%M:%S')}")
+                logger.info(f"⏰ Próximo ciclo em {current_interval}s")
+                logger.info(req_counter.get_stats())
+                
+                if not req_counter.can_request():
+                    logger.warning("⚠️ Limite diário atingido. Aguardando reset...")
+                    await asyncio.sleep(3600)  # Espera 1h
+                    continue
 
+                # Busca jogos (1 requisição, mas com cache de 2min)
+                matches = await api.get_live_smart()
+                
+                if not matches:
+                    logger.info("📭 Nenhum jogo ao vivo nas ligas prioritárias")
+                    await asyncio.sleep(current_interval)
+                    continue
+                
+                logger.info(f"⚽ {len(matches)} jogos ao vivo monitorados")
+                
+                # Processa apenas jogos promissores
                 for m in matches:
+                    if not req_counter.can_request():
+                        logger.warning("⚠️ Limite atingido durante ciclo")
+                        break
+                    
                     fixture = m.get("fixture", {})
                     fid = fixture.get("id")
                     if not fid:
@@ -405,62 +548,26 @@ async def main_loop():
                     status = fixture.get("status", {})
                     minute = status.get("elapsed")
                     minute = int(minute) if minute else None
+                    
+                    if not minute or minute < 10:  # Ignora início de jogo
+                        continue
 
+                    # Busca stats (com cache de 5min)
                     stats = await api.get_full_statistics(fid)
-
+                    
                     corners_home = stats["corners_home"]
                     corners_away = stats["corners_away"]
                     total_corners = stats["corners_total"]
 
+                    # Aplica regras
                     rules_hit = apply_rules_from_values(minute, total_corners, corners_home, corners_away)
 
+                    # Nova entrada detectada
                     if rules_hit and fid not in active_matches:
                         home = m["teams"]["home"]["name"]
                         away = m["teams"]["away"]["name"]
                         league = m["league"]["name"]
 
                         md = MatchData(fid, home, away, league, None, minute, corners_home, corners_away)
-                        md.suggestions = IntelligentAnalyzer.generate_suggestions(stats, rules_hit, minute or 0, home, away)
-
-                        msg = await safe_send(format_entry_message(md, stats, minute or 0, rules_hit, md.suggestions))
-                        if msg:
-                            md.message_id = msg.message_id
-                            active_matches[fid] = md
-
-                    if fid in active_matches:
-                        md = active_matches[fid]
-                        if md.next_corner_after_entry is None:
-                            if corners_home > md.corners_at_entry_home:
-                                md.next_corner_after_entry = "Mandante"
-                            elif corners_away > md.corners_at_entry_away:
-                                md.next_corner_after_entry = "Visitante"
-
-                await asyncio.sleep(POLL_INTERVAL)
-
-            except Exception as e:
-                logger.error(f"Erro no loop principal: {e}", exc_info=True)
-                await asyncio.sleep(POLL_INTERVAL)
-
-# =========================================================
-# KEEP-ALIVE + START
-# =========================================================
-
-async def handle(request):
-    return web.Response(text="CornerBot PRO Online")
-
-async def start_server():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    port = int(os.environ.get("PORT", 3000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Servidor keep-alive rodando na porta {port}")
-
-async def main():
-    await start_server()
-    await main_loop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                        md.suggestions = IntelligentAnalyzer.generate_suggestions(
+                            stats, rules_hit
