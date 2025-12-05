@@ -854,5 +854,9 @@ async def main():
     aguarde iniciar_servidor()
     aguardar loop_principal()
 
+async def main():
+    aguarde iniciar_servidor()
+    aguardar loop_principal()
+
 se __name__ == "__main__":
     asyncio.run(main())
